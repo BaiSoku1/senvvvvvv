@@ -16,19 +16,168 @@ local o = io
 local p = os
 local q = {}
 q.__index = q
+
+local r, BLOCKED_OUTPUT_PATTERNS = (function()
+-- cat_config.lua: Configuration and output-safety patterns for the catmio dumper.
+-- Returns two values: (config_table, blocked_patterns_list)
 local r = {
-    MAX_DEPTH = 15,
-    MAX_TABLE_ITEMS = 150,
+    MAX_DEPTH = 50,
+    MAX_TABLE_ITEMS = 10000,
     OUTPUT_FILE = "dumped_output.lua",
     VERBOSE = false,
     TRACE_CALLBACKS = true,
-    TIMEOUT_SECONDS = 6.7,
-    MAX_REPEATED_LINES = 6,
-    MIN_DEOBF_LENGTH = 150,
-    MAX_OUTPUT_SIZE = 6 * 1024 * 1024,
+    TIMEOUT_SECONDS = 120,  -- Internal limit; must be < DUMP_TIMEOUT in cat.py (130s) to allow cleanup
+    MAX_REPEATED_LINES = 200,
+    MIN_DEOBF_LENGTH = 50,
+    MAX_OUTPUT_SIZE = 200 * 1024 * 1024,
     CONSTANT_COLLECTION = true,
-    INSTRUMENT_LOGIC = true
+    INSTRUMENT_LOGIC = true,
+    DUMP_GLOBALS = true,
+    DUMP_ALL_STRINGS = false,
+    DUMP_WAD_STRINGS = false,
+    DUMP_DECODED_STRINGS = false,
+    DUMP_LIGHTCATE_STRINGS = false,
+    EMIT_XOR = false,
+    DUMP_UPVALUES = true,
+    MAX_UPVALUES_PER_FUNCTION = 200,
+    DUMP_GC_SCAN = true,
+    DUMP_INSTANCE_CREATIONS = true,
+    DUMP_SCRIPT_LOADS = true,
+    DUMP_REMOTE_SUMMARY = true,
+    -- Maximum objects returned by getgc() stubs (limits memory / iteration cost)
+    MAX_GC_OBJECTS = 500,
+    -- Maximum functions scanned by dump_gc_scan() (separate from getgc return limit)
+    MAX_GC_SCAN_FUNCTIONS = 500,
+    MAX_INSTANCE_CREATIONS = 1000,
+    MAX_SCRIPT_LOADS = 200,
+    -- Maximum characters of a loadstring payload kept as a diagnostic snippet
+    MAX_SCRIPT_LOAD_SNIPPET = 80,
+    -- Extra collection options
+    DUMP_FUNCTIONS = true,
+    DUMP_METATABLES = true,
+    DUMP_CLOSURES = true,
+    DUMP_REMOTE_CALLS = true,
+    DUMP_CONSTANTS = true,
+    DUMP_HOOKS = true,
+    DUMP_SIGNALS = true,
+    DUMP_ATTRIBUTES = true,
+    DUMP_PROPERTIES = true,
+    TRACK_ENV_WRITES = true,
+    TRACK_ENV_READS = false,
+    COLLECT_ALL_CALLS = true,
+    EMIT_COMMENTS = true,
+    STRIP_WHITESPACE = false,
+    MAX_STRING_LENGTH = 65536,
+    MAX_PROXY_DEPTH = 32,
+    MAX_HOOK_CALLS = 500,
+    MAX_REMOTE_CALLS = 1000,
+    MAX_SIGNAL_CALLBACKS = 100,
+    MAX_CLOSURE_REFS = 500,
+    MAX_CONST_PER_FUNCTION = 512,
+    MAX_DEFERRED_HOOKS = 200,
+    OBFUSCATION_THRESHOLD = 0.35,
+    INLINE_SMALL_FUNCTIONS = true,
+    EMIT_LOOP_COUNTER = false,
+    EMIT_CALL_GRAPH = true,
+    EMIT_STRING_REFS = true,
+    EMIT_TYPE_ANNOTATIONS = false,
+    -- Loop detection threshold: how many times the same source line must be
+    -- hit (via the count hook) before a "-- Detected loops N" marker is emitted.
+    LOOP_DETECT_THRESHOLD = 100,
+    -- ----------------------------------------------------------------------
+    -- Envlogger v2 knobs (cat_envlogger.lua).
+    -- ----------------------------------------------------------------------
+    -- Emit a one-shot dashboard at the end of the dump summarising what was
+    -- produced (string-pool sizes, remote-call counts, etc.).
+    ENVLOGGER_RUN_SUMMARY = false,
+    -- Cross-section string interning: when the same value appears in more
+    -- than one decoded pool, only emit it as a literal once and reference
+    -- the canonical _str_N id from later pools.
+    ENVLOGGER_INTERN_POOLS = false,
+    -- Emit an envlogger diagnostics block (truncations, caught errors,
+    -- dedup hits). Off by default so existing dump output is unchanged.
+    ENVLOGGER_DIAGNOSTICS = false,
+    -- Maximum lines any single envlogger section may emit before it is
+    -- forcibly truncated. Per-section cap; the global MAX_OUTPUT_SIZE
+    -- still applies on top.
+    MAX_LINES_PER_SECTION = 10000,
+    -- When true, captured global writes get a trailing comment indicating
+    -- whether they came from the sandboxed env table or the real _G:
+    --   foo = "bar" -- (env)
+    -- Off by default so the dump format matches the original cat_envlogger.
+    ENVLOGGER_LABEL_GLOBAL_SOURCE = false,
+    -- ----------------------------------------------------------------------
+    -- Envlogger v3 supplemental sections (cat_envlogger.lua).
+    -- Each gate flag is checked with `~= false`, so these default to ON.
+    -- Set to false to silence an individual section.
+    -- ----------------------------------------------------------------------
+    DUMP_PROPERTY_STORE        = true,  -- Instance.* property writes
+    DUMP_HOOK_CALLS            = true,  -- hookfunction/hookmetamethod/etc.
+    DUMP_LOOP_SUMMARY          = true,  -- top-N hot lines + [HOT] markers
+    DUMP_COUNTERS              = true,  -- non-zero runtime counters
+    DUMP_RUNTIME_POINTERS      = true,  -- last_http_url, namecall_method, ...
+    DUMP_OBFUSCATOR_FINGERPRINT = true, -- which obfuscator(s) produced input
+    DUMP_THREAT_ASSESSMENT     = true,  -- 0..100 risk score + indicators
+    DUMP_TIMELINE              = true,  -- chronological event log
+    -- Tunables for the v3 sections.
+    LOOP_SUMMARY_TOP_N         = 25,    -- hot-line table size
+    THREAT_SAMPLE_CAP          = 20,    -- max indicator samples emitted
+    THREAT_SCAN_GLOBAL_TABLE   = true,  -- include _G in threat scan
+    TIMELINE_CAP               = 200,   -- chronological event log size
 }
+local BLOCKED_OUTPUT_PATTERNS = {
+    "os%.execute",
+    "os%.getenv",
+    "os%.exit",
+    "os%.remove",
+    "os%.rename",
+    "os%.tmpname",
+    "io%.open",
+    "io%.popen",
+    "io%.lines",
+    "io%.read",
+    "io%.write",
+    -- shell-style directory / file listing indicators
+    "total %d",             -- output of `ls -l`
+    "^drwx", "^%-rwx",     -- Unix file-permission lines
+    "^[dD]irectory of ",   -- Windows `dir` header
+    "[Vv]olume in drive",  -- Windows `dir` header
+    -- absolute filesystem paths that might be leaked
+    "/etc/",
+    "/home/",
+    "/root/",
+    "/var/",
+    "/tmp/",
+    "/proc/",
+    "/sys/",
+    "C:\\[Uu]sers\\",
+    "C:\\[Ww]indows\\",
+    "C:\\[Pp]rogram",
+    -- environment-variable style leaks
+    "PATH=",
+    "HOME=",
+    "USER=",
+    "SHELL=",
+    -- credential / secret leaks
+    "TOKEN%s*=",
+    "SECRET%s*=",
+    "PASSWORD%s*=",
+    "API_KEY%s*=",
+    "WEBHOOK%s*=",
+    -- Discord bot token format (starts with a base64-ish string of ~24 chars
+    -- followed by a dot; we match the canonical NTKâ€¦. prefix shape)
+    "Nz[A-Za-z0-9_%-]+%.[A-Za-z0-9_%-]+%.[A-Za-z0-9_%-]+",
+    -- Discord webhook URLs
+    "discord%.com/api/webhooks/",
+    "discordapp%.com/api/webhooks/",
+    -- GitHub personal-access token prefixes
+    "ghp_[A-Za-z0-9]+",
+    "gho_[A-Za-z0-9]+",
+    "ghs_[A-Za-z0-9]+",
+}
+return r, BLOCKED_OUTPUT_PATTERNS
+end)()
+
 local s = arg and arg[3]
 if s then
     print("[Dumper] Auto-Input Key Detected: " .. tostring(s))
@@ -395,7 +544,301 @@ local aJ = {
     TextService = "TextService",
     TextChatService = "TextChatService",
     ContentProvider = "ContentProvider",
-    Debris = "Debris"
+    Debris = "Debris",
+    ReplicatedFirst = "ReplicatedFirst",
+    LocalizationService = "LocalizationService",
+    MaterialService = "MaterialService",
+    Selection = "Selection",
+    ScriptContext = "ScriptContext",
+    TestService = "TestService",
+    LogService = "LogService",
+    PluginManager = "PluginManager",
+    ScriptEditorService = "ScriptEditorService",
+    StudioService = "StudioService",
+    ChangeHistoryService = "ChangeHistoryService",
+    Mouse = "Mouse",
+    KeyframeSequenceProvider = "KeyframeSequenceProvider",
+    AnimationService = "AnimationService",
+    BadgeService = "BadgeService",
+    VoiceChatService = "VoiceChatService",
+    PrivateMessagingService = "PrivateMessagingService",
+    FriendMessengerService = "FriendMessengerService",
+    NotificationService = "NotificationService",
+    PolicyService = "PolicyService",
+    StatsService = "StatsService",
+    PerformanceService = "PerformanceService",
+    MemoryStoreService = "MemoryStoreService",
+    SocialService = "SocialService",
+    NetworkSettings = "NetworkSettings",
+    TouchEnabledService = "TouchEnabledService",
+    GameSettings = "GameSettings",
+    FocusService = "FocusService",
+    UserGameSettings = "UserGameSettings",
+    UtilityService = "UtilityService",
+    WebService = "WebService",
+    BasePlayerSettings = "BasePlayerSettings",
+    ControllerService = "ControllerService",
+    DragDetectorService = "DragDetectorService",
+    FastFlags = "FastFlags",
+    FlagService = "FlagService",
+    FrameRateManager = "FrameRateManager",
+    GamepadService = "GamepadService",
+    GeometryService = "GeometryService",
+    GestureService = "GestureService",
+    IconService = "IconService",
+    InputService = "InputService",
+    LiveOpsService = "LiveOpsService",
+    MultiModalService = "MultiModalService",
+    NavigationService = "NavigationService",
+    ParticleEmitterService = "ParticleEmitterService",
+    PointsService = "PointsService",
+    PresenceService = "PresenceService",
+    PurchasePromptService = "PurchasePromptService",
+    ReportageService = "ReportageService",
+    ScreenshotService = "ScreenshotService",
+    ScreenShotService = "ScreenShotService",
+    SecureMessagingService = "SecureMessagingService",
+    ServerReplicatorService = "ServerReplicatorService",
+    ShaderService = "ShaderService",
+    SkyboxService = "SkyboxService",
+    SmokeService = "SmokeService",
+    StickerService = "StickerService",
+    StreamableService = "StreamableService",
+    TelemetryService = "TelemetryService",
+    TerrainService = "TerrainService",
+    TestHarnessService = "TestHarnessService",
+    TestServiceLegacy = "TestServiceLegacy",
+    TextureService = "TextureService",
+    ToolService = "ToolService",
+    TutorialService = "TutorialService",
+    UserService = "UserService",
+    ValueService = "ValueService",
+    WeaveService = "WeaveService",
+    WebGLService = "WebGLService",
+    WebRequestService = "WebRequestService",
+    WindowService = "WindowService",
+    VirtualUser = "VirtualUser",
+    AssetService = "AssetService",
+    AnalyticsService = "AnalyticsService",
+    GroupService = "GroupService",
+    FriendsService = "FriendsService",
+    AccountInformationService = "AccountInformationService",
+    AdService = "AdService",
+    AdvancedDraggerService = "AdvancedDraggerService",
+    AssetManagerService = "AssetManagerService",
+    AssetThemeService = "AssetThemeService",
+    AudioAnalyzerService = "AudioAnalyzerService",
+    AudioService = "AudioService",
+    AvatarExportService = "AvatarExportService",
+    AvatarService = "AvatarService",
+    BaseScriptService = "BaseScriptService",
+    BasicSettings = "BasicSettings",
+    BinaryDataService = "BinaryDataService",
+    BodyMoverService = "BodyMoverService",
+    BrowserService = "BrowserService",
+    CSGDictionaryService = "CSGDictionaryService",
+    CSGPersistenceService = "CSGPersistenceService",
+    CSGPolygonService = "CSGPolygonService",
+    CSGService = "CSGService",
+    CSGSurfaceService = "CSGSurfaceService",
+    CSGToolService = "CSGToolService",
+    CSGValidationService = "CSGValidationService",
+    CachingService = "CachingService",
+    CameraScriptService = "CameraScriptService",
+    CameraService = "CameraService",
+    CaptchaService = "CaptchaService",
+    ClickDetectorService = "ClickDetectorService",
+    CloudService = "CloudService",
+    ClusterService = "ClusterService",
+    CommandService = "CommandService",
+    CommerceService = "CommerceService",
+    ConnectorService = "ConnectorService",
+    ConstraintService = "ConstraintService",
+    CraftService = "CraftService",
+    CreatorService = "CreatorService",
+    CrossDataService = "CrossDataService",
+    CuratedContentService = "CuratedContentService",
+    CustomEventService = "CustomEventService",
+    CustomMeshService = "CustomMeshService",
+    DataModel = "DataModel",
+    DialogService = "DialogService",
+    DisplayOrderService = "DisplayOrderService",
+    DistributeService = "DistributeService",
+    EmoteService = "EmoteService",
+    EncoderService = "EncoderService",
+    EngineService = "EngineService",
+    ExperienceInviteService = "ExperienceInviteService",
+    FaceAnimatorService = "FaceAnimatorService",
+    FilePickerService = "FilePickerService",
+    FileService = "FileService",
+    ForceFeedbackService = "ForceFeedbackService",
+    GamepassService = "GamepassService",
+    GearService = "GearService",
+    GravityService = "GravityService",
+    GridService = "GridService",
+    HighlightService = "HighlightService",
+    HomeService = "HomeService",
+    IdentityService = "IdentityService",
+    ImageService = "ImageService",
+    ImportService = "ImportService",
+    InternalService = "InternalService",
+    JobService = "JobService",
+    KeyboardService = "KeyboardService",
+    LMSController = "LMSController",
+    LMSService = "LMSService",
+    LODService = "LODService",
+    LSPersistenceService = "LSPersistenceService",
+    LeaderStatsService = "LeaderStatsService",
+    LensService = "LensService",
+    LevelOfDetailService = "LevelOfDetailService",
+    LibraryService = "LibraryService",
+    LightService = "LightService",
+    LightingService = "LightingService",
+    LocalUserService = "LocalUserService",
+    LoginService = "LoginService",
+    MOdService = "MOdService",
+    MacroService = "MacroService",
+    ManipulationService = "ManipulationService",
+    MapService = "MapService",
+    MatchmakingService = "MatchmakingService",
+    MediaService = "MediaService",
+    MeshService = "MeshService",
+    MessageService = "MessageService",
+    MidScoreService = "MidScoreService",
+    MigrationService = "MigrationService",
+    ModerationService = "ModerationService",
+    ModuleScriptService = "ModuleScriptService",
+    MoveService = "MoveService",
+    MultiplayerService = "MultiplayerService",
+    NameCallService = "NameCallService",
+    NetworkClient = "NetworkClient",
+    NetworkPeer = "NetworkPeer",
+    NetworkServer = "NetworkServer",
+    ObfuscationService = "ObfuscationService",
+    ObjectCacheService = "ObjectCacheService",
+    ObjectService = "ObjectService",
+    OcclusionService = "OcclusionService",
+    PackageService = "PackageService",
+    PageService = "PageService",
+    ParentService = "ParentService",
+    PerfService = "PerfService",
+    PersistenceService = "PersistenceService",
+    PhysicsDebugService = "PhysicsDebugService",
+    PlacementService = "PlacementService",
+    PlatformService = "PlatformService",
+    PlayService = "PlayService",
+    ProceduralMeshService = "ProceduralMeshService",
+    ProfanityService = "ProfanityService",
+    ProgressService = "ProgressService",
+    PromptService = "PromptService",
+    PropertyService = "PropertyService",
+    ProximityService = "ProximityService",
+    PurchaseService = "PurchaseService",
+    QuestService = "QuestService",
+    RaycastService = "RaycastService",
+    ReactionService = "ReactionService",
+    RecommendationService = "RecommendationService",
+    RecordingService = "RecordingService",
+    RemoteFunctionService = "RemoteFunctionService",
+    RemoteService = "RemoteService",
+    RenderService = "RenderService",
+    ReplicationService = "ReplicationService",
+    ReportService = "ReportService",
+    ResumeService = "ResumeService",
+    RetailService = "RetailService",
+    RetargetingService = "RetargetingService",
+    RigBuilderService = "RigBuilderService",
+    RigService = "RigService",
+    RobloxPluginService = "RobloxPluginService",
+    RobloxReplicatedStorage = "RobloxReplicatedStorage",
+    RulesService = "RulesService",
+    SKUManager = "SKUManager",
+    SKUService = "SKUService",
+    SandboxService = "SandboxService",
+    SceneConversionService = "SceneConversionService",
+    SceneService = "SceneService",
+    ScreenshotFeedbackService = "ScreenshotFeedbackService",
+    ScriptService = "ScriptService",
+    SearchService = "SearchService",
+    SeatService = "SeatService",
+    SecurityService = "SecurityService",
+    SensorService = "SensorService",
+    ServerHostService = "ServerHostService",
+    ServerScript = "ServerScript",
+    ServiceContainer = "ServiceContainer",
+    ServiceProvider = "ServiceProvider",
+    SessionService = "SessionService",
+    SettingsService = "SettingsService",
+    SimulationService = "SimulationService",
+    SkeletonService = "SkeletonService",
+    SkinningService = "SkinningService",
+    SocialNetworkingService = "SocialNetworkingService",
+    SoundGroupService = "SoundGroupService",
+    SpawnLocationService = "SpawnLocationService",
+    SpatialService = "SpatialService",
+    SpringService = "SpringService",
+    SpriteService = "SpriteService",
+    StartupService = "StartupService",
+    StoryService = "StoryService",
+    StreamingService = "StreamingService",
+    StringService = "StringService",
+    StudioAssetService = "StudioAssetService",
+    StudioDataService = "StudioDataService",
+    StudioDeviceService = "StudioDeviceService",
+    StudioGestureService = "StudioGestureService",
+    StudioOnlyService = "StudioOnlyService",
+    StudioPublishService = "StudioPublishService",
+    StudioTestService = "StudioTestService",
+    StyleService = "StyleService",
+    SurfaceService = "SurfaceService",
+    TaskSchedulerService = "TaskSchedulerService",
+    TeamCreateService = "TeamCreateService",
+    TeleportClient = "TeleportClient",
+    TemplateService = "TemplateService",
+    TerrainPhysicsService = "TerrainPhysicsService",
+    TextFilterService = "TextFilterService",
+    TexturePackService = "TexturePackService",
+    ThemeService = "ThemeService",
+    ThirdPartyService = "ThirdPartyService",
+    ThumbnailService = "ThumbnailService",
+    TileService = "TileService",
+    TimeService = "TimeService",
+    ToolboxService = "ToolboxService",
+    TourService = "TourService",
+    TransactionService = "TransactionService",
+    TranslationService = "TranslationService",
+    TweenServiceInternal = "TweenServiceInternal",
+    UIBlurService = "UIBlurService",
+    UIDragService = "UIDragService",
+    UIGradientService = "UIGradientService",
+    UIGridService = "UIGridService",
+    UILayoutService = "UILayoutService",
+    UIListLayoutService = "UIListLayoutService",
+    UIPageLayoutService = "UIPageLayoutService",
+    UIScaleService = "UIScaleService",
+    UIScreenSizeService = "UIScreenSizeService",
+    UIService = "UIService",
+    UIStrokeService = "UIStrokeService",
+    UITableLayoutService = "UITableLayoutService",
+    UITextService = "UITextService",
+    UIViewportService = "UIViewportService",
+    URLService = "URLService",
+    UndoService = "UndoService",
+    UnitScaleService = "UnitScaleService",
+    UniverseService = "UniverseService",
+    UpdateService = "UpdateService",
+    VFXService = "VFXService",
+    VehicleService = "VehicleService",
+    VideoService = "VideoService",
+    ViewportService = "ViewportService",
+    VisibilityService = "VisibilityService",
+    VoiceService = "VoiceService",
+    WaterService = "WaterService",
+    WebServiceInternal = "WebServiceInternal",
+    WebSocketService = "WebSocketService",
+    WelcomeScreenService = "WelcomeScreenService",
+    WorldRootService = "WorldRootService",
+    WrappingService = "WrappingService"
 }
 local aK = {
     Players = "Players",
@@ -418,7 +861,312 @@ local aK = {
     ContextActionService = "ContextActionService",
     CollectionService = "CollectionService",
     PathfindingService = "PathfindingService",
-    Debris = "Debris"
+    Debris = "Debris",
+    GuiService = "GuiService",
+    VirtualUser = "VirtualUser",
+    VRService = "VRService",
+    PhysicsService = "PhysicsService",
+    AssetService = "AssetService",
+    AnalyticsService = "AnalyticsService",
+    GroupService = "GroupService",
+    FriendsService = "FriendsService",
+    TextService = "TextService",
+    LocalizationService = "LocalizationService",
+    MaterialService = "MaterialService",
+    Selection = "Selection",
+    ScriptContext = "ScriptContext",
+    TestService = "TestService",
+    LogService = "LogService",
+    InsertService = "InsertService",
+    PluginManager = "PluginManager",
+    ScriptEditorService = "ScriptEditorService",
+    StudioService = "StudioService",
+    ChangeHistoryService = "ChangeHistoryService",
+    Mouse = "Mouse",
+    KeyframeSequenceProvider = "KeyframeSequenceProvider",
+    AnimationService = "AnimationService",
+    BadgeService = "BadgeService",
+    VoiceChatService = "VoiceChatService",
+    PrivateMessagingService = "PrivateMessagingService",
+    FriendMessengerService = "FriendMessengerService",
+    NotificationService = "NotificationService",
+    PolicyService = "PolicyService",
+    StatsService = "StatsService",
+    PerformanceService = "PerformanceService",
+    MemoryStoreService = "MemoryStoreService",
+    ServerStorage = "ServerStorage",
+    ServerScriptService = "ServerScriptService",
+    StarterPack = "StarterPack",
+    StarterPlayer = "StarterPlayer",
+    ReplicatedFirst = "ReplicatedFirst",
+    SocialService = "SocialService",
+    NetworkSettings = "NetworkSettings",
+    TouchEnabledService = "TouchEnabledService",
+    GameSettings = "GameSettings",
+    FocusService = "FocusService",
+    UserGameSettings = "UserGameSettings",
+    UtilityService = "UtilityService",
+    WebService = "WebService",
+    ContentProvider = "ContentProvider",
+    BasePlayerSettings = "BasePlayerSettings",
+    ControllerService = "ControllerService",
+    DragDetectorService = "DragDetectorService",
+    FastFlags = "FastFlags",
+    FlagService = "FlagService",
+    FrameRateManager = "FrameRateManager",
+    GamepadService = "GamepadService",
+    GeometryService = "GeometryService",
+    GestureService = "GestureService",
+    HapticService = "HapticService",
+    IconService = "IconService",
+    InputService = "InputService",
+    LiveOpsService = "LiveOpsService",
+    MultiModalService = "MultiModalService",
+    NavigationService = "NavigationService",
+    ParticleEmitterService = "ParticleEmitterService",
+    PointsService = "PointsService",
+    PresenceService = "PresenceService",
+    PurchasePromptService = "PurchasePromptService",
+    ReportageService = "ReportageService",
+    ScreenshotService = "ScreenshotService",
+    ScreenShotService = "ScreenShotService",
+    SecureMessagingService = "SecureMessagingService",
+    ServerReplicatorService = "ServerReplicatorService",
+    ShaderService = "ShaderService",
+    SkyboxService = "SkyboxService",
+    SmokeService = "SmokeService",
+    StickerService = "StickerService",
+    StreamableService = "StreamableService",
+    TelemetryService = "TelemetryService",
+    TerrainService = "TerrainService",
+    TestHarnessService = "TestHarnessService",
+    TestServiceLegacy = "TestServiceLegacy",
+    TextureService = "TextureService",
+    ToolService = "ToolService",
+    TutorialService = "TutorialService",
+    UserService = "UserService",
+    ValueService = "ValueService",
+    WeaveService = "WeaveService",
+    WebGLService = "WebGLService",
+    WebRequestService = "WebRequestService",
+    WindowService = "WindowService",
+    AccountInformationService = "AccountInformationService",
+    AdService = "AdService",
+    AdvancedDraggerService = "AdvancedDraggerService",
+    AssetManagerService = "AssetManagerService",
+    AssetThemeService = "AssetThemeService",
+    AudioAnalyzerService = "AudioAnalyzerService",
+    AudioService = "AudioService",
+    AvatarExportService = "AvatarExportService",
+    AvatarService = "AvatarService",
+    BaseScriptService = "BaseScriptService",
+    BasicSettings = "BasicSettings",
+    BinaryDataService = "BinaryDataService",
+    BodyMoverService = "BodyMoverService",
+    BrowserService = "BrowserService",
+    CSGDictionaryService = "CSGDictionaryService",
+    CSGPersistenceService = "CSGPersistenceService",
+    CSGPolygonService = "CSGPolygonService",
+    CSGService = "CSGService",
+    CSGSurfaceService = "CSGSurfaceService",
+    CSGToolService = "CSGToolService",
+    CSGValidationService = "CSGValidationService",
+    CachingService = "CachingService",
+    CameraScriptService = "CameraScriptService",
+    CameraService = "CameraService",
+    CaptchaService = "CaptchaService",
+    ClickDetectorService = "ClickDetectorService",
+    CloudService = "CloudService",
+    ClusterService = "ClusterService",
+    CommandService = "CommandService",
+    CommerceService = "CommerceService",
+    ConnectorService = "ConnectorService",
+    ConstraintService = "ConstraintService",
+    CraftService = "CraftService",
+    CreatorService = "CreatorService",
+    CrossDataService = "CrossDataService",
+    CuratedContentService = "CuratedContentService",
+    CustomEventService = "CustomEventService",
+    CustomMeshService = "CustomMeshService",
+    DataModel = "DataModel",
+    DialogService = "DialogService",
+    DisplayOrderService = "DisplayOrderService",
+    DistributeService = "DistributeService",
+    EmoteService = "EmoteService",
+    EncoderService = "EncoderService",
+    EngineService = "EngineService",
+    ExperienceInviteService = "ExperienceInviteService",
+    FaceAnimatorService = "FaceAnimatorService",
+    FilePickerService = "FilePickerService",
+    FileService = "FileService",
+    ForceFeedbackService = "ForceFeedbackService",
+    GamepassService = "GamepassService",
+    GearService = "GearService",
+    GravityService = "GravityService",
+    GridService = "GridService",
+    HighlightService = "HighlightService",
+    HomeService = "HomeService",
+    IdentityService = "IdentityService",
+    ImageService = "ImageService",
+    ImportService = "ImportService",
+    InternalService = "InternalService",
+    JobService = "JobService",
+    KeyboardService = "KeyboardService",
+    LMSController = "LMSController",
+    LMSService = "LMSService",
+    LODService = "LODService",
+    LSPersistenceService = "LSPersistenceService",
+    LeaderStatsService = "LeaderStatsService",
+    LensService = "LensService",
+    LevelOfDetailService = "LevelOfDetailService",
+    LibraryService = "LibraryService",
+    LightService = "LightService",
+    LightingService = "LightingService",
+    LocalUserService = "LocalUserService",
+    LoginService = "LoginService",
+    MOdService = "MOdService",
+    MacroService = "MacroService",
+    ManipulationService = "ManipulationService",
+    MapService = "MapService",
+    MatchmakingService = "MatchmakingService",
+    MediaService = "MediaService",
+    MeshService = "MeshService",
+    MessageService = "MessageService",
+    MidScoreService = "MidScoreService",
+    MigrationService = "MigrationService",
+    ModerationService = "ModerationService",
+    ModuleScriptService = "ModuleScriptService",
+    MoveService = "MoveService",
+    MultiplayerService = "MultiplayerService",
+    NameCallService = "NameCallService",
+    NetworkClient = "NetworkClient",
+    NetworkPeer = "NetworkPeer",
+    NetworkServer = "NetworkServer",
+    ObfuscationService = "ObfuscationService",
+    ObjectCacheService = "ObjectCacheService",
+    ObjectService = "ObjectService",
+    OcclusionService = "OcclusionService",
+    PackageService = "PackageService",
+    PageService = "PageService",
+    ParentService = "ParentService",
+    PerfService = "PerfService",
+    PersistenceService = "PersistenceService",
+    PhysicsDebugService = "PhysicsDebugService",
+    PlacementService = "PlacementService",
+    PlatformService = "PlatformService",
+    PlayService = "PlayService",
+    ProceduralMeshService = "ProceduralMeshService",
+    ProfanityService = "ProfanityService",
+    ProgressService = "ProgressService",
+    PromptService = "PromptService",
+    PropertyService = "PropertyService",
+    ProximityService = "ProximityService",
+    PurchaseService = "PurchaseService",
+    QuestService = "QuestService",
+    RaycastService = "RaycastService",
+    ReactionService = "ReactionService",
+    RecommendationService = "RecommendationService",
+    RecordingService = "RecordingService",
+    RemoteFunctionService = "RemoteFunctionService",
+    RemoteService = "RemoteService",
+    RenderService = "RenderService",
+    ReplicationService = "ReplicationService",
+    ReportService = "ReportService",
+    ResumeService = "ResumeService",
+    RetailService = "RetailService",
+    RetargetingService = "RetargetingService",
+    RigBuilderService = "RigBuilderService",
+    RigService = "RigService",
+    RobloxPluginService = "RobloxPluginService",
+    RobloxReplicatedStorage = "RobloxReplicatedStorage",
+    RulesService = "RulesService",
+    SKUManager = "SKUManager",
+    SKUService = "SKUService",
+    SandboxService = "SandboxService",
+    SceneConversionService = "SceneConversionService",
+    SceneService = "SceneService",
+    ScreenshotFeedbackService = "ScreenshotFeedbackService",
+    ScriptService = "ScriptService",
+    SearchService = "SearchService",
+    SeatService = "SeatService",
+    SecurityService = "SecurityService",
+    SensorService = "SensorService",
+    ServerHostService = "ServerHostService",
+    ServerScript = "ServerScript",
+    ServiceContainer = "ServiceContainer",
+    ServiceProvider = "ServiceProvider",
+    SessionService = "SessionService",
+    SettingsService = "SettingsService",
+    SimulationService = "SimulationService",
+    SkeletonService = "SkeletonService",
+    SkinningService = "SkinningService",
+    SocialNetworkingService = "SocialNetworkingService",
+    SoundGroupService = "SoundGroupService",
+    SpawnLocationService = "SpawnLocationService",
+    SpatialService = "SpatialService",
+    SpringService = "SpringService",
+    SpriteService = "SpriteService",
+    StartupService = "StartupService",
+    StoryService = "StoryService",
+    StreamingService = "StreamingService",
+    StringService = "StringService",
+    StudioAssetService = "StudioAssetService",
+    StudioDataService = "StudioDataService",
+    StudioDeviceService = "StudioDeviceService",
+    StudioGestureService = "StudioGestureService",
+    StudioOnlyService = "StudioOnlyService",
+    StudioPublishService = "StudioPublishService",
+    StudioTestService = "StudioTestService",
+    StyleService = "StyleService",
+    SurfaceService = "SurfaceService",
+    TaskSchedulerService = "TaskSchedulerService",
+    TeamCreateService = "TeamCreateService",
+    TeleportClient = "TeleportClient",
+    TemplateService = "TemplateService",
+    TerrainPhysicsService = "TerrainPhysicsService",
+    TextFilterService = "TextFilterService",
+    TexturePackService = "TexturePackService",
+    ThemeService = "ThemeService",
+    ThirdPartyService = "ThirdPartyService",
+    ThumbnailService = "ThumbnailService",
+    TileService = "TileService",
+    TimeService = "TimeService",
+    ToolboxService = "ToolboxService",
+    TourService = "TourService",
+    TransactionService = "TransactionService",
+    TranslationService = "TranslationService",
+    TweenServiceInternal = "TweenServiceInternal",
+    UIBlurService = "UIBlurService",
+    UIDragService = "UIDragService",
+    UIGradientService = "UIGradientService",
+    UIGridService = "UIGridService",
+    UILayoutService = "UILayoutService",
+    UIListLayoutService = "UIListLayoutService",
+    UIPageLayoutService = "UIPageLayoutService",
+    UIScaleService = "UIScaleService",
+    UIScreenSizeService = "UIScreenSizeService",
+    UIService = "UIService",
+    UIStrokeService = "UIStrokeService",
+    UITableLayoutService = "UITableLayoutService",
+    UITextService = "UITextService",
+    UIViewportService = "UIViewportService",
+    URLService = "URLService",
+    UndoService = "UndoService",
+    UnitScaleService = "UnitScaleService",
+    UniverseService = "UniverseService",
+    UpdateService = "UpdateService",
+    VFXService = "VFXService",
+    VehicleService = "VehicleService",
+    VideoService = "VideoService",
+    ViewportService = "ViewportService",
+    VisibilityService = "VisibilityService",
+    VoiceService = "VoiceService",
+    WaterService = "WaterService",
+    WebServiceInternal = "WebServiceInternal",
+    WebSocketService = "WebSocketService",
+    WelcomeScreenService = "WelcomeScreenService",
+    WorldRootService = "WorldRootService",
+    WrappingService = "WrappingService"
 }
 local aL = {
     {pattern = "window", prefix = "Window", counter = "window"},
@@ -491,7 +1239,7 @@ local function aW(x, aQ, aX, aS)
         return aY
     end
     t.lar_counter = (t.lar_counter or 0) + 1
-    local am = "lar" .. t.lar_counter
+    local am = "Senvielle" .. t.lar_counter
     t.names_used[am] = true
     t.registry[x] = am
     t.reverse_registry[am] = x
@@ -887,6 +1635,16 @@ bk = function(aS, bw)
     end
     return bh
 end
+local _script_registry = {}
+local _script_registry_set = {}
+local function _register_script_proxy(x, name)
+    local n = tostring(name or "")
+    if not _script_registry_set[x] then
+        _script_registry_set[x] = true
+        table.insert(_script_registry, x)
+    end
+end
+
 bj = function(aQ, bO, bw)
     local bh, bi = bg()
     local aT = aE(aQ)
@@ -929,6 +1687,7 @@ bj = function(aQ, bO, bw)
         else
             at(string.format("local %s = %s:FindFirstChild(%s)", _, bS, aH(bV)))
         end
+        _register_script_proxy(x, bV)
         return x
     end
     bP.FindFirstChildOfClass = function(self, bX)
@@ -972,31 +1731,30 @@ bj = function(aQ, bO, bw)
         return x
     end
     bP.GetChildren = function(self)
-        local bS = t.registry[bh] or "object"
-        at(string.format("for _, child in %s:GetChildren() do", bS))
-        t.indent = t.indent + 1
-        t.pending_iterator = true
-        return {}
+    local bS = t.registry[bh] or "object"
+    local children_list = {}
+    if t.property_store[bh] and t.property_store[bh].Children then
+        children_list = t.property_store[bh].Children
     end
-    bP.GetDescendants = function(self)
-        local bS = t.registry[bh] or "object"
-        at(string.format("for _, obj in %s:GetDescendants() do", bS))
-        t.indent = t.indent + 1
-        local b_ = bj("obj", false)
-        t.registry[b_] = "obj"
-        t.property_store[b_] = {Name = "Ball", ClassName = "Part", Size = Vector3.new(1, 1, 1)}
-        local c0 = false
-        return function()
-            if not c0 then
-                c0 = true
-                return 1, b_
-            else
-                t.indent = t.indent - 1
-                at("end")
-                return nil
+    at(string.format("-- %s:GetChildren() returned %d items", bS, #children_list))
+    return children_list
+end
+
+bP.GetDescendants = function(self)
+    local bS = t.registry[bh] or "object"
+    local descendants = {}
+    local function collect(node)
+        if t.property_store[node] and t.property_store[node].Children then
+            for _, child in ipairs(t.property_store[node].Children) do
+                table.insert(descendants, child)
+                collect(child)
             end
-        end, nil, 0
+        end
     end
+    collect(bh)
+    at(string.format("-- %s:GetDescendants() returned %d items", bS, #descendants))
+    return descendants
+end
     bP.Clone = function(self)
         local bS = t.registry[bh] or "object"
         local x = bj((aT or "object") .. "Clone", false)
@@ -1009,38 +1767,148 @@ bj = function(aQ, bO, bw)
         at(string.format("%s:Destroy()", bS))
     end
     bP.ClearAllChildren = function(self)
-        local bS = t.registry[bh] or "object"
-        at(string.format("%s:ClearAllChildren()", bS))
-    end
-    bP.Connect = function(self, bs)
-        local bS = t.registry[bh] or "signal"
-        local c1 = bj("connection", false)
-        local c2 = aW(c1, "conn")
-        local c3 = bS:match("%.([^%.]+)$") or bS
-        local c4 = {"..."}
-        if c3:match("InputBegan") or c3:match("InputEnded") or c3:match("InputChanged") then
-            c4 = {"input", "gameProcessed"}
-        elseif c3:match("CharacterAdded") or c3:match("CharacterRemoving") then
-            c4 = {"character"}
-        elseif c3:match("PlayerAdded") or c3:match("PlayerRemoving") then
-            c4 = {"player"}
-        elseif c3:match("Touched") then
-            c4 = {"hit"}
-        elseif c3:match("Heartbeat") or c3:match("RenderStepped") then
-            c4 = {"deltaTime"}
-        elseif c3:match("Stepped") then
-            c4 = {"time", "deltaTime"}
-        elseif c3:match("Changed") then
-            c4 = {"property"}
-        elseif c3:match("ChildAdded") or c3:match("ChildRemoved") then
-            c4 = {"child"}
-        elseif c3:match("DescendantAdded") or c3:match("DescendantRemoving") then
-            c4 = {"descendant"}
-        elseif c3:match("Died") or c3:match("MouseButton") or c3:match("Activated") then
-            c4 = {}
-        elseif c3:match("FocusLost") then
-            c4 = {"enterPressed", "inputObject"}
+    local bS = t.registry[bh] or "object"
+    at(string.format("%s:ClearAllChildren()", bS))
+    
+    -- HAPUS SEMUA CHILDREN dan bersihkan parent_map
+    if t.property_store[bh] and t.property_store[bh].Children then
+        local children_copy = {}
+        for _, child in ipairs(t.property_store[bh].Children) do
+            table.insert(children_copy, child)
         end
+        for _, child in ipairs(children_copy) do
+            if t.property_store[child] then
+                t.property_store[child].Parent = nil
+            end
+            t.parent_map[child] = nil
+        end
+        t.property_store[bh].Children = {}
+    end
+end
+    bP.Connect = function(self, bs)
+    local bS = t.registry[bh] or "signal"
+    local c1 = bj("connection", false)
+    local c2 = aW(c1, "conn")
+    local c3 = bS:match("%.([^%.]+)$") or bS
+    local c4 = {"..."}
+
+    if c3:match("InputBegan") or c3:match("InputEnded") or c3:match("InputChanged") then
+        c4 = {"input", "gameProcessed"}
+
+    elseif c3:match("CharacterAdded") or c3:match("CharacterRemoving") then
+        c4 = {"character"}
+
+    elseif c3:match("PlayerAdded") or c3:match("PlayerRemoving") then
+        c4 = {"player"}
+
+    elseif c3:match("Touched") or c3:match("TouchEnded") then
+        c4 = {"hit"}
+
+    elseif c3:match("Heartbeat") or c3:match("RenderStepped") then
+        c4 = {"deltaTime"}
+
+    elseif c3:match("Stepped") then
+        c4 = {"time", "deltaTime"}
+
+    elseif c3:match("Changed") or c3:match("GetPropertyChangedSignal") then
+        c4 = {"property"}
+
+    elseif c3:match("ChildAdded") or c3:match("ChildRemoved") then
+        c4 = {"child"}
+
+    elseif c3:match("DescendantAdded") or c3:match("DescendantRemoving") then
+        c4 = {"descendant"}
+
+    elseif c3:match("AncestryChanged") then
+        c4 = {"child", "parent"}
+
+    elseif c3:match("Died") or c3:match("MouseButton") or c3:match("Activated") then
+        c4 = {}
+
+    elseif c3:match("FocusLost") then
+        c4 = {"enterPressed", "inputObject"}
+
+    elseif c3:match("Focused") then
+        c4 = {}
+
+    elseif c3:match("MouseEnter") or c3:match("MouseLeave") then
+        c4 = {}
+
+    elseif c3:match("MouseMoved") then
+        c4 = {"x", "y"}
+
+    elseif c3:match("SelectionGained") or c3:match("SelectionLost") then
+        c4 = {}
+
+    elseif c3:match("JumpRequest") then
+        c4 = {}
+
+    elseif c3:match("StateChanged") then
+        c4 = {"oldState", "newState"}
+
+    elseif c3:match("HealthChanged") then
+        c4 = {"health"}
+
+    elseif c3:match("Running") then
+        c4 = {"speed"}
+
+    elseif c3:match("FreeFalling") then
+        c4 = {"isFalling"}
+
+    elseif c3:match("Climbing") then
+        c4 = {"speed"}
+
+    elseif c3:match("Seated") then
+        c4 = {"isSeated", "seatPart"}
+
+    elseif c3:match("MoveToFinished") then
+        c4 = {"reached"}
+
+    elseif c3:match("OnClientEvent") then
+        c4 = {"..."}
+
+    elseif c3:match("OnServerEvent") then
+        c4 = {"player", "..."}
+
+    elseif c3:match("RemoteOnInvokeServer") then
+        c4 = {"player", "..."}
+
+    elseif c3:match("RemoteOnInvokeClient") then
+        c4 = {"..."}
+
+    elseif c3:match("PromptButtonHoldBegan") or c3:match("PromptButtonHoldEnded") then
+        c4 = {"player"}
+
+    elseif c3:match("Triggered") then
+        c4 = {"player"}
+
+    elseif c3:match("AnimationPlayed") then
+        c4 = {"track"}
+
+    elseif c3:match("Stopped") then
+        c4 = {}
+
+    elseif c3:match("KeyframeReached") then
+        c4 = {"keyframeName"}
+
+    elseif c3:match("MarkerReached") then
+        c4 = {"markerName"}
+
+    elseif c3:match("Completed") then
+        c4 = {"playbackState"}
+
+    elseif c3:match("ItemAdded") or c3:match("ItemRemoved") then
+        c4 = {"item"}
+
+    elseif c3:match("Collision") then
+        c4 = {"part"}
+
+    elseif c3:match("Chatted") then
+        c4 = {"message"}
+
+    elseif c3:match("TeamChanged") then
+        c4 = {"team"}
+    end
         at(string.format("local %s = %s:Connect(function(%s)", c2, bS, table.concat(c4, ", ")))
         t.indent = t.indent + 1
         if j(bs) == "function" then
@@ -1122,9 +1990,13 @@ bj = function(aQ, bO, bw)
         return c8
     end
     bP.Play = function(self)
-        local bS = t.registry[bh] or "tween"
-        at(string.format("%s:Play()", bS))
+    local bS = t.registry[bh] or "tween"
+    at(string.format("%s:Play()", bS))
+    if self._tween_info and self._tween_info._duration then
+        self._start_time = os.clock()
+        self._duration = self._tween_info._duration
     end
+end
     bP.Pause = function(self)
         local bS = t.registry[bh] or "tween"
         at(string.format("%s:Pause()", bS))
@@ -1133,6 +2005,29 @@ bj = function(aQ, bO, bw)
         local bS = t.registry[bh] or "tween"
         at(string.format("%s:Cancel()", bS))
     end
+    bP._completedSignal = nil
+bP._getCompletedSignal = function(self)
+    if not self._completedSignal then
+        local sig = bj("RBXScriptSignal", false)
+        self._completedSignal = sig
+        local dur = self._duration or 0.1
+        sig.Wait = function()
+            local st = os.clock()
+            while os.clock() - st < dur do task.wait() end
+            return true
+        end
+        sig.Connect = function(s, cb)
+            task.spawn(function()
+                if self._duration then task.wait(self._duration) end
+                if cb then pcall(cb) end
+            end)
+            return {Disconnect = function() end}
+        end
+    end
+    return self._completedSignal
+end
+
+bP.Completed = nil
     bP.Stop = function(self)
         local bS = t.registry[bh] or "tween"
         at(string.format("%s:Stop()", bS))
@@ -1180,12 +2075,27 @@ bj = function(aQ, bO, bw)
         return true
     end
     bP.GetAttribute = function(self, cj)
-        return nil
+    local bS = t.registry[bh] or "instance"
+    at(string.format("-- %s:GetAttribute(%s)", bS, aH(cj)))
+    if not t.property_store[bh] then
+        t.property_store[bh] = {}
     end
+    if not t.property_store[bh].Attributes then
+        t.property_store[bh].Attributes = {}
+    end
+    return t.property_store[bh].Attributes[cj]
+end
     bP.SetAttribute = function(self, cj, bm)
-        local bS = t.registry[bh] or "instance"
-        at(string.format("%s:SetAttribute(%s, %s)", bS, aH(cj), aZ(bm)))
+    local bS = t.registry[bh] or "instance"
+    if not t.property_store[bh] then
+        t.property_store[bh] = {}
     end
+    if not t.property_store[bh].Attributes then
+        t.property_store[bh].Attributes = {}
+    end
+    t.property_store[bh].Attributes[cj] = bm
+    at(string.format("%s:SetAttribute(%s, %s)", bS, aH(cj), aZ(bm)))
+end
     bP.GetAttributes = function(self)
         return {}
     end
@@ -1286,11 +2196,26 @@ bj = function(aQ, bO, bw)
         at(string.format("%s:PivotTo(%s)", bS, aZ(cw)))
     end
     bP.GetPivot = function(self)
-        return CFrame.new(0, 0, 0)
+    return CFrame.new(0, 0, 0)
+end
+
+bP.BulkMoveTo = function(self, parts, cframes, bulkMoveMode)
+    if type(parts) == "table" and type(cframes) == "table" then
+        for i, part in ipairs(parts) do
+            if i <= #cframes and part then
+                if not t.property_store[part] then
+                    t.property_store[part] = {}
+                end
+                t.property_store[part].CFrame = cframes[i]
+            end
+        end
     end
-    bP.GetBoundingBox = function(self)
-        return CFrame.new(0, 0, 0), Vector3.new(1, 1, 1)
-    end
+    return true
+end
+
+bP.GetBoundingBox = function(self)
+    return CFrame.new(0, 0, 0), Vector3.new(1, 1, 1)
+end
     bP.GetExtentsSize = function(self)
         return Vector3.new(1, 1, 1)
     end
@@ -1376,15 +2301,31 @@ bj = function(aQ, bO, bw)
         local bS = t.registry[bh] or "Debris"
         at(string.format("%s:AddItem(%s, %s)", bS, aZ(cN), aZ(cO or 10)))
     end
+    bP.AddItems = function(self, cN, cO)
+        local bS = t.registry[bh] or "Debris"
+        at(string.format("%s:AddItems(%s, %s)", bS, aZ(cN), aZ(cO or 10)))
+    end
     bi.__index = function(b2, b4)
-        if b4 == F or b4 == "__proxy_id" then
-            return rawget(b2, b4)
-        end
-        if b4 == "PlaceId" or b4 == "GameId" or b4 == "placeId" or b4 == "gameId" then
-            return u
-        end
-        local bS = t.registry[bh] or aT or "object"
-        local cP = aE(b4)
+    if b4 == F or b4 == "__proxy_id" then
+        return rawget(b2, b4)
+    end
+    if b4 == "PlaceId" or b4 == "GameId" or b4 == "placeId" or b4 == "gameId" then
+        return u
+    end
+    if b4 == "Parent" then
+        return t.property_store[bh] and t.property_store[bh].Parent or nil
+    end
+    if b4 == "Attributes" then
+    if not t.property_store[bh] then
+        t.property_store[bh] = {}
+    end
+    if not t.property_store[bh].Attributes then
+        t.property_store[bh].Attributes = {}
+    end
+    return t.property_store[bh].Attributes
+end
+    local bS = t.registry[bh] or aT or "object"
+    local cP = aE(b4)
         if t.property_store[bh] and t.property_store[bh][b4] ~= nil then
             return t.property_store[bh][b4]
         end
@@ -1410,41 +2351,65 @@ bj = function(aQ, bO, bw)
             return cQ
         end
         if bS == "fenv" or bS == "getgenv" or bS == "_G" then
-            if b4 == "game" then
-                return game
-            end
-            if b4 == "workspace" then
-                return workspace
-            end
-            if b4 == "script" then
-                return script
-            end
-            if b4 == "Enum" then
-                return Enum
-            end
-            if _G[b4] ~= nil then
-                return _G[b4]
-            end
-            return nil
-        end
-        if b4 == "Parent" then
-            return t.parent_map[bh] or bj("Parent", false)
-        end
-        if b4 == "Name" then
-            return aT or "Object"
-        end
-        if b4 == "ClassName" then
-            return aT or "Instance"
-        end
-        if b4 == "LocalPlayer" then
-            local cT = bj("LocalPlayer", false, bh)
-            local _ = aW(cT, "LocalPlayer")
-            at(string.format("local %s = %s.LocalPlayer", _, bS))
-            return cT
-        end
-        if b4 == "PlayerGui" then
-            return bj("PlayerGui", false, bh)
-        end
+    if b4 == "game" then
+        return game
+    end
+    if b4 == "workspace" then
+        return workspace
+    end
+    if b4 == "script" then
+        return script
+    end
+    if b4 == "Enum" then
+        return Enum
+    end
+    if _G[b4] ~= nil then
+        return _G[b4]
+    end
+    return nil
+end
+
+if b4 == "EnumType" then
+    local enum_name = t.registry[bh]:match("(Enum%.[^.]+)%.")
+    if enum_name then
+        return rawget(_G, enum_name) or Enum
+    end
+    return Enum
+end
+
+if b4 == "Parent" then
+    return t.parent_map[bh] or bj("Parent", false)
+end
+
+if b4 == "Name" then
+    return aT or "Object"
+end
+
+if b4 == "ClassName" then
+    return aT or "Instance"
+end
+
+if b4 == "LocalPlayer" then
+    local cT = bj("LocalPlayer", false, bh)
+    local _ = aW(cT, "LocalPlayer")
+    at(string.format("local %s = %s.LocalPlayer", _, bS))
+    return cT
+end
+
+if b4 == "MembershipType" then
+    local mt = bj("Enum.MembershipType.None", false)
+    t.registry[mt] = "Enum.MembershipType.None"
+    if not t.property_store[mt] then
+        t.property_store[mt] = {}
+    end
+    t.property_store[mt].Name = "None"
+    t.property_store[mt].Value = 0
+    return mt
+end
+
+if b4 == "PlayerGui" then
+    return bj("PlayerGui", false, bh)
+end
         if b4 == "Backpack" then
             return bj("Backpack", false, bh)
         end
@@ -1517,28 +2482,29 @@ bj = function(aQ, bO, bw)
             return bj("Humanoid", false, bh)
         end
         local cY = {
-            Health = 100,
-            MaxHealth = 100,
-            WalkSpeed = 16,
-            JumpPower = 50,
-            JumpHeight = 7.2,
-            HipHeight = 2,
-            Transparency = 0,
-            Mass = 1,
-            Value = 0,
-            TimePosition = 0,
-            TimeLength = 1,
-            Volume = 0.5,
-            PlaybackSpeed = 1,
-            Brightness = 1,
-            Range = 60,
-            Angle = 90,
-            FieldOfView = 70,
-            Size = 1,
-            Thickness = 1,
-            ZIndex = 1,
-            LayoutOrder = 0
-        }
+    Health = 100,
+    MaxHealth = 100,
+    WalkSpeed = 16,
+    JumpPower = 50,
+    JumpHeight = 7.2,
+    HipHeight = 2,
+    Transparency = 0,
+    Mass = 1,
+    Value = 0,
+    TimePosition = 0,
+    TimeLength = 1,
+    Volume = 0.5,
+    PlaybackSpeed = 1,
+    Brightness = 1,
+    Range = 60,
+    Angle = 90,
+    FieldOfView = 70,
+    Size = 1,
+    Thickness = 1,
+    ZIndex = 1,
+    LayoutOrder = 0,
+    MembershipType = rawget(Enum, "MembershipType") and rawget(Enum, "MembershipType").None or bl(0),
+}
         if cY[b4] then
             return bl(cY[b4])
         end
@@ -1741,20 +2707,65 @@ bj = function(aQ, bO, bw)
         end
         return bk(cP, bh)
     end
+    if cP == "Completed" then
+    if not bP._completedSignal then
+        bP._completedSignal = bP._getCompletedSignal(bh)
+    end
+    return bP._completedSignal
+end
     bi.__newindex = function(b2, b4, b5)
-        if b4 == F or b4 == "__proxy_id" then
-            rawset(b2, b4, b5)
-            return
+    if b4 == F or b4 == "__proxy_id" then
+        rawset(b2, b4, b5)
+        return
+    end
+    local bS = t.registry[bh] or aT or "object"
+    local cP = aE(b4)
+    
+    if bS == "Sound" and b4 == "PlaybackLoudness" then
+    error("Attempt to set readonly property PlaybackLoudness", 2)
+    end
+
+    t.property_store[bh] = t.property_store[bh] or {}
+    
+    if b4 == "Parent" then
+        -- HAPUS DARI OLD PARENT
+        local old_parent = t.property_store[bh].Parent
+        if old_parent and t.property_store[old_parent] and t.property_store[old_parent].Children then
+            for i, child in ipairs(t.property_store[old_parent].Children) do
+                if child == bh then
+                    table.remove(t.property_store[old_parent].Children, i)
+                    break
+                end
+            end
         end
-        local bS = t.registry[bh] or aT or "object"
-        local cP = aE(b4)
-        t.property_store[bh] = t.property_store[bh] or {}
-        t.property_store[bh][b4] = b5
-        if b4 == "Parent" and G(b5) then
+        -- SET NEW PARENT
+        t.property_store[bh].Parent = b5
+        if b5 and G(b5) then
+            if not t.property_store[b5] then
+                t.property_store[b5] = {}
+            end
+            if not t.property_store[b5].Children then
+                t.property_store[b5].Children = {}
+            end
+            -- CEK DUPLIKAT SEBELUM INSERT
+            local already_exists = false
+            for _, child in ipairs(t.property_store[b5].Children) do
+                if child == bh then
+                    already_exists = true
+                    break
+                end
+            end
+            if not already_exists then
+                table.insert(t.property_store[b5].Children, bh)
+            end
             t.parent_map[bh] = b5
         end
+        at(string.format("%s.Parent = %s", bS, aZ(b5)))
+    else
+        t.property_store[bh][b4] = b5
         at(string.format("%s.%s = %s", bS, cP, aZ(b5)))
     end
+end
     bi.__call = function(b2, ...)
         local bS = t.registry[bh] or aT or "func"
         if bS == "fenv" or bS == "getgenv" or bS:match("env") then
@@ -1989,7 +3000,13 @@ BrickColor =
         palette = true
     }
 )
-TweenInfo = da("TweenInfo", {new = true})
+TweenInfo = function(duration, easeStyle, easeDirection, repeatCount, reverses, delayTime)
+    local proxy = da("TweenInfo", {new = true})("new", duration, easeStyle, easeDirection, repeatCount, reverses, delayTime)
+    if proxy and type(proxy) == "table" then
+        proxy._duration = duration or 0.1
+    end
+    return proxy
+end
 Rect = da("Rect", {new = true})
 Region3 = da("Region3", {new = true})
 Region3int16 = da("Region3int16", {new = true})
@@ -2037,7 +3054,26 @@ setmetatable(
 )
 Enum = bj("Enum", true)
 local dm = a.getmetatable(Enum)
+local old_enum_index = dm.__index
 dm.__index = function(b2, b4)
+    if b4 == "GetEnumItems" then
+        return function(self)
+            local items = {}
+            for k, v in pairs(self) do
+                if k ~= "GetEnumItems" and type(v) ~= "function" then
+                    if G(v) then
+                        if not t.property_store[v] then
+                            t.property_store[v] = {}
+                        end
+                        t.property_store[v].Name = t.property_store[v].Name or tostring(k)
+                        t.property_store[v].Value = t.property_store[v].Value or 1
+                        table.insert(items, v)
+                    end
+                end
+            end
+            return items
+        end
+    end
     if b4 == F or b4 == "__proxy_id" then
         return rawget(b2, b4)
     end
@@ -2046,24 +3082,48 @@ dm.__index = function(b2, b4)
     return dn
 end
 Instance = {new = function(bX, bS)
-        local bY = aE(bX)
-        local x = bj(bY, false)
-        local _ = aW(x, bY)
-        if bS then
-            local dp = t.registry[bS] or aZ(bS)
-            at(string.format("local %s = Instance.new(%s, %s)", _, aH(bY), dp))
-            t.parent_map[x] = bS
-        else
-            at(string.format("local %s = Instance.new(%s)", _, aH(bY)))
+    local bY = aE(bX)
+    local x = bj(bY, false)
+    local _ = aW(x, bY)
+    if bS then
+        local dp = t.registry[bS] or aZ(bS)
+        at(string.format("local %s = Instance.new(%s, %s)", _, aH(bY), dp))
+        t.parent_map[x] = bS
+        if not t.property_store[x] then
+            t.property_store[x] = {}
         end
-        return x
-    end}
+        t.property_store[x].Parent = bS
+        if not t.property_store[bS] then
+            t.property_store[bS] = {}
+        end
+        if not t.property_store[bS].Children then
+            t.property_store[bS].Children = {}
+        end
+        table.insert(t.property_store[bS].Children, x)
+    else
+        at(string.format("local %s = Instance.new(%s)", _, aH(bY)))
+    end
+    return x
+end}
 game = bj("game", true)
 workspace = bj("workspace", true)
 script = bj("script", true)
 t.property_store[script] = {Name = "DumpedScript", Parent = game, ClassName = "LocalScript"}
 task = {
+    _add_heartbeat = function(fn)
+        if type(fn) == "function" then
+            table.insert(_G.__heartbeat_callbacks, fn)
+        end
+    end,
     wait = function(dq)
+        for _, cb in ipairs(_G.__heartbeat_callbacks or {}) do
+            pcall(cb, dq or 0.016)
+        end
+        t.wait_calls = (t.wait_calls or 0) + 1
+        if t.wait_calls > r.TASK_WAIT_LIMIT then
+            at("error('lunr: task.wait infinite loop detected and stopped')")
+            error('lunr: task.wait infinite loop detected and stopped')
+        end
         if dq then
             at(string.format("task.wait(%s)", aZ(dq)))
         else
@@ -2072,63 +3132,78 @@ task = {
         return dq or 0.03, p.clock()
     end,
     spawn = function(dr, ...)
+        if type(dr) ~= "function" and type(dr) ~= "thread" then
+            error("invalid argument #1 to 'spawn' (function or thread expected)", 2)
+        end
         local bA = {...}
-        at("task.spawn(function()")
-        t.indent = t.indent + 1
-        if j(dr) == "function" then
-            xpcall(
-                function()
-                    dr(table.unpack(bA))
-                end,
-                function(ds)
-                    at("-- [Error in spawn] " .. tostring(ds))
+        local thread = coroutine.create(function() return true end)
+        if at("task.spawn(function()") then
+            t.indent = t.indent + 1
+            if j(dr) == "function" then
+                local success, result = pcall(dr, table.unpack(bA or {}))
+                if not success then
+                    at("-- Error in task.spawn: " .. tostring(result))
                 end
-            )
-        end
-        while t.pending_iterator do
+            elseif j(dr) == "thread" then
+                pcall(coroutine.resume, dr)
+            end
+            while t.pending_iterator do
+                t.indent = t.indent - 1
+                at("end")
+                t.pending_iterator = false
+            end
             t.indent = t.indent - 1
-            at("end")
-            t.pending_iterator = false
+            at("end)")
         end
-        t.indent = t.indent - 1
-        at("end)")
+        return thread
     end,
     delay = function(dq, dr, ...)
         local bA = {...}
-        at(string.format("task.delay(%s, function()", aZ(dq or 0)))
-        t.indent = t.indent + 1
-        if j(dr) == "function" then
-            xpcall(
-                function()
-                    dr(table.unpack(bA))
-                end,
-                function()
-                end
-            )
-        end
-        while t.pending_iterator do
+        if at(string.format("task.delay(%s, function()", aZ(dq or 0))) then
+            t.indent = t.indent + 1
+            -- Env-check bypass: skip running long-delay callbacks (e.g. 5s) so anti-env-logger scripts complete
+            if j(dr) == "function" and (dq or 0) < 1 then
+                xpcall(
+                    function()
+                        dr(table.unpack(bA or {}))
+                    end,
+                    function(ds)
+                    end
+                )
+            end
+            while t.pending_iterator do
+                t.indent = t.indent - 1
+                at("end")
+                t.pending_iterator = false
+            end
             t.indent = t.indent - 1
-            at("end")
-            t.pending_iterator = false
+            at("end)")
         end
-        t.indent = t.indent - 1
-        at("end)")
     end,
     defer = function(dr, ...)
         local bA = {...}
-        at("task.defer(function()")
-        t.indent = t.indent + 1
-        if j(dr) == "function" then
-            xpcall(
-                function()
-                    dr(table.unpack(bA))
-                end,
-                function()
-                end
-            )
+        if at("task.defer(function()") then
+            t.indent = t.indent + 1
+            if j(dr) == "function" then
+                xpcall(
+                    function()
+                        dr(table.unpack(bA or {}))
+                    end,
+                    function(ds)
+                --    if m(ds):match("LIMIT") or m(ds):match("DUMPER") then
+                   --       i(ds, 0)
+                   --   end
+                    end
+                )
+            end
+            while t.pending_iterator do
+                t.indent = t.indent - 1
+                at("end")
+                t.pending_iterator = false
+            end
+            t.indent = t.indent - 1
+            at("end)")
         end
-        t.indent = t.indent - 1
-        at("end)")
     end,
     cancel = function(dt)
         at("task.cancel(thread)")
@@ -2141,6 +3216,11 @@ task = {
     end
 }
 wait = function(dq)
+    t.wait_calls = (t.wait_calls or 0) + 1
+    if t.wait_calls > r.TASK_WAIT_LIMIT then
+        at("error('lunr: wait infinite loop detected and stopped')")
+        error('lunr: wait infinite loop detected and stopped')
+    end
     if dq then
         at(string.format("wait(%s)", aZ(dq)))
     else
@@ -2285,299 +3365,926 @@ local function dz(dA)
     end
     return setmetatable(bh, dd)
 end
-local exploit_funcs = {getgenv = function()
-        return dz(nil)
-    end, getrenv = function()
-        return bj("getrenv()", false)
-    end, getfenv = function(dH)
-        return _G
-    end, setfenv = function(dI, dJ)
-        if j(dI) ~= "function" then
-            return
-        end
+
+local original_type = type
+local original_typeof = typeof
+local original_tonumber = tonumber
+local original_tostring = tostring
+local original_error = error
+local original_getmetatable = getmetatable
+local original_pcall = pcall
+local original_xpcall = xpcall
+
+local exploit_funcs = {
+    getgenv = function() return dz(nil) end,
+    getrenv = function() return bj("getrenv()", false) end,
+    getfenv = function(dH) return _G end,
+    setfenv = function(dI, dJ)
+        if j(dI) ~= "function" then return end
         local L = 1
         while true do
             local am = debug.getupvalue(dI, L)
             if am == "_ENV" then
                 debug.setupvalue(dI, L, dJ)
                 break
-            elseif not am then
-                break
-            end
+            elseif not am then break end
             L = L + 1
         end
         return dI
-    end, hookfunction = function(dK, dL)
-        return dK
-    end, hookmetamethod = function(x, dM, dN)
-        return function()
-        end
-    end, getrawmetatable = function(x)
-        if G(x) then
-            return a.getmetatable(x)
-        end
+    end,
+    hookfunction = function(dK, dL) return dK end,
+    hookmetamethod = function(x, dM, dN) return function() end end,
+    getrawmetatable = function(x)
+        if G(x) then return a.getmetatable(x) end
         return {}
-    end, setrawmetatable = function(x, dd)
-        return x
-    end, getnamecallmethod = function()
-        return "__namecall"
-    end, setnamecallmethod = function(dM)
-    end, checkcaller = function()
-        return true
-    end, islclosure = function(dr)
-        return j(dr) == "function"
-    end, iscclosure = function(dr)
-        return false
-    end, newcclosure = function(dr)
-        return dr
-    end, clonefunction = function(dr)
-        return dr
-    end, request = function(dO)
+    end,
+    setrawmetatable = function(x, dd) return x end,
+    getnamecallmethod = function() return "__namecall" end,
+    setnamecallmethod = function(dM) end,
+    checkcaller = function() return true end,
+    islclosure = function(dr) return j(dr) == "function" end,
+    iscclosure = function(dr) return false end,
+    newcclosure = function(dr) return dr end,
+    clonefunction = function(dr) return dr end,
+    
+    type = function(x)
+        if G(x) then
+            local reg = t.registry[x]
+            if reg and type(reg) == "string" then
+                if reg:match('^"') or reg:match("^'") or reg:match('^%[') then
+                    return "string"
+                end
+                if tonumber(reg) ~= nil then
+                    return "number"
+                end
+                if reg == "true" or reg == "false" then
+                    return "boolean"
+                end
+            end
+            return "userdata"
+        end
+        return original_type(x)
+    end,
+    
+    typeof = function(x)
+        if G(x) and t.property_store[x] and t.property_store[x].X ~= nil then
+            return "Vector3"
+        end
+        if G(x) then
+            local reg = t.registry[x]
+            if reg and reg:match("^Vector3") then
+                return "Vector3"
+            end
+        end
+        return original_typeof(x)
+    end,
+    
+    tonumber = function(x, base)
+        return original_tonumber(x, base)
+    end,
+    
+    tostring = function(x)
+        if G(x) then
+            local reg = t.registry[x]
+            if reg then
+                if type(reg) == "string" and (reg:match('^"') or reg:match("^'")) then
+                    return reg:sub(2, -2)
+                end
+                return reg
+            end
+            return "Instance"
+        end
+        return original_tostring(x)
+    end,
+    
+    print = function(...)
+        local args = {...}
+        local out = {}
+        for i, arg in ipairs(args) do
+            table.insert(out, tostring(arg))
+        end
+        at(string.format("print(%s)", table.concat(out, ", ")))
+    end,
+    
+    error = function(msg, level)
+        original_error(msg, level)
+    end,
+    
+    utf8 = {
+        len = function(s)
+            if type(s) == "string" then
+                local _, count = string.gsub(s, "[%z\1-\127\194-\244][\128-\191]*", "")
+                return count
+            end
+            if G(s) then
+                local reg = t.registry[s]
+                if reg and type(reg) == "string" then
+                    local _, count = string.gsub(reg, "[%z\1-\127\194-\244][\128-\191]*", "")
+                    return count
+                end
+            end
+            return nil
+        end
+    },
+    
+    getmetatable = function(x)
+        if G(x) then return nil end
+        return original_getmetatable(x)
+    end,
+    
+    pcall = function(func, ...)
+        return original_pcall(func, ...)
+    end,
+    
+    xpcall = function(func, err, ...)
+        return original_xpcall(func, err, ...)
+    end,
+
+    request = function(dO)
         at(string.format("request(%s)", aZ(dO)))
         table.insert(t.string_refs, {value = dO.Url or dO.url or "unknown", hint = "HTTP Request"})
         return {Success = true, StatusCode = 200, StatusMessage = "OK", Headers = {}, Body = "{}"}
-    end, http_request = function(dO)
-        return exploit_funcs.request(dO)
-    end, syn = {request = function(dO)
-            return exploit_funcs.request(dO)
-        end}, http = {request = function(dO)
-            return exploit_funcs.request(dO)
-        end}, HttpPost = function(cI, cJ)
+    end,
+    http_request = function(dO) return exploit_funcs.request(dO) end,
+    syn = {request = function(dO) return exploit_funcs.request(dO) end},
+    http = {request = function(dO) return exploit_funcs.request(dO) end},
+    HttpPost = function(cI, cJ)
         at(string.format("HttpPost(%s, %s)", aE(cI), aE(cJ)))
         return "{}"
-    end, setclipboard = function(cJ)
-        at(string.format("setclipboard(%s)", aZ(cJ)))
-    end, getclipboard = function()
-        return '"'
-    end, identifyexecutor = function()
-        return "Dumper", "3.0"
-    end, getexecutorname = function()
-        return "Dumper"
-    end, gethui = function()
+    end,
+    setclipboard = function(cJ) at(string.format("setclipboard(%s)", aZ(cJ))) end,
+    getclipboard = function() return '"' end,
+    identifyexecutor = function() return "Dumper", "3.0" end,
+    getexecutorname = function() return "Dumper" end,
+    gethui = function()
         local dP = bj("HiddenUI", false)
         aW(dP, "HiddenUI")
         at(string.format("local %s = gethui()", t.registry[dP]))
         return dP
-    end, gethiddenui = function()
-        return exploit_funcs.gethui()
-    end, protectgui = function(dQ)
-    end, iswindowactive = function()
-        return true
-    end, isrbxactive = function()
-        return true
-    end, isgameactive = function()
-        return true
-    end, getconnections = function(cg)
-        return {}
-    end, firesignal = function(cg, ...)
-    end, fireclickdetector = function(dR, dS)
-    end, fireproximityprompt = function(dT)
-    end, firetouchinterest = function(dU, dV, dW)
-    end, getinstances = function()
-        return {}
-    end, getnilinstances = function()
-        return {}
-    end, getgc = function()
-        return {}
-    end, getscripts = function()
-        return {}
-    end, getrunningscripts = function()
-        return {}
-    end, getloadedmodules = function()
-        return {}
-    end, getcallingscript = function()
-        return script
-    end, readfile = function(dA)
+    end,
+    gethiddenui = function() return exploit_funcs.gethui() end,
+    protectgui = function(dQ) end,
+    iswindowactive = function() return true end,
+    isrbxactive = function() return true end,
+    isgameactive = function() return true end,
+    getconnections = function(cg) return {} end,
+    firesignal = function(cg, ...) end,
+    fireclickdetector = function(dR, dS) end,
+    fireproximityprompt = function(dT) end,
+    firetouchinterest = function(dU, dV, dW) end,
+    getinstances = function() return {} end,
+    getnilinstances = function() return {} end,
+    getgc = function() return {} end,
+    getscripts = function() return {} end,
+    getrunningscripts = function() return _script_registry end,
+    getloadedmodules = function() return {} end,
+    getcallingscript = function() return script end,
+    
+    readfile = function(dA)
         at(string.format("readfile(%s)", aH(dA)))
-        return '"'
-    end, writefile = function(dA, ai)
-        at(string.format("writefile(%s, %s)", aH(dA), aZ(ai)))
-    end, appendfile = function(dA, ai)
-        at(string.format("appendfile(%s, %s)", aH(dA), aZ(ai)))
-    end, loadfile = function(dA)
-        return function()
-            return bj("loaded_file", false)
+        local content = ""
+        local file = io.open(dA:gsub("^\"(.*)\"$", "%1"), "r")
+        if file then
+            content = file:read("*a")
+            file:close()
         end
-    end, listfiles = function(dX)
-        return {}
-    end, isfile = function(dA)
+        return content
+    end,
+    writefile = function(dA, ai)
+        at(string.format("writefile(%s, %s)", aH(dA), aZ(ai)))
+        local file = io.open(dA:gsub("^\"(.*)\"$", "%1"), "w")
+        if file then
+            local content = ai
+            if type(ai) == "string" and ai:match("^[\"'](.*)[\"']$") then
+                content = ai:sub(2, -2)
+            end
+            file:write(content)
+            file:close()
+        end
+    end,
+    appendfile = function(dA, ai)
+        at(string.format("appendfile(%s, %s)", aH(dA), aZ(ai)))
+        local file = io.open(dA:gsub("^\"(.*)\"$", "%1"), "a")
+        if file then
+            local content = ai
+            if type(ai) == "string" and ai:match("^[\"'](.*)[\"']$") then
+                content = ai:sub(2, -2)
+            end
+            file:write(content)
+            file:close()
+        end
+    end,
+    loadfile = function(dA)
+        at(string.format("loadfile(%s)", aH(dA)))
+        local path = dA:gsub("^\"(.*)\"$", "%1")
+        local file = io.open(path, "r")
+        if file then
+            local content = file:read("*a")
+            file:close()
+            local func, err = load(content, "@" .. path)
+            if func then return func end
+        end
+        return function() 
+            local proxy = bj("loaded_file", false)
+            return proxy
+        end
+    end,
+    dofile = function(dA)
+        at(string.format("dofile(%s)", aH(dA)))
+        local func = loadfile(dA)
+        if func then return func() end
+        return nil
+    end,
+    isfile = function(dA)
+        at(string.format("isfile(%s)", aH(dA)))
+        local path = dA:gsub("^\"(.*)\"$", "%1")
+        local file = io.open(path, "r")
+        if file then
+            file:close()
+            return true
+        end
         return false
-    end, isfolder = function(dA)
+    end,
+    isfolder = function(dA)
+        at(string.format("isfolder(%s)", aH(dA)))
+        local path = dA:gsub("^\"(.*)\"$", "%1")
+        local file = io.open(path, "r")
+        if file then
+            file:close()
+            return false
+        end
+        local testfile = io.open(path .. "/.test", "w")
+        if testfile then
+            testfile:close()
+            os.remove(path .. "/.test")
+            return true
+        end
         return false
-    end, makefolder = function(dA)
+    end,
+    makefolder = function(dA)
         at(string.format("makefolder(%s)", aH(dA)))
-    end, delfolder = function(dA)
+        local path = dA:gsub("^\"(.*)\"$", "%1")
+        os.execute('mkdir "' .. path .. '" 2>nul')
+        os.execute('mkdir "' .. path .. '"')
+    end,
+    delfolder = function(dA)
         at(string.format("delfolder(%s)", aH(dA)))
-    end, delfile = function(dA)
+        local path = dA:gsub("^\"(.*)\"$", "%1")
+        os.execute('rmdir "' .. path .. '" /s /q 2>nul')
+        os.execute('rm -rf "' .. path .. '"')
+    end,
+    delfile = function(dA)
         at(string.format("delfile(%s)", aH(dA)))
-    end, Drawing = {new = function(aO)
+        local path = dA:gsub("^\"(.*)\"$", "%1")
+        os.remove(path)
+    end,
+    copyfile = function(src, dest)
+        at(string.format("copyfile(%s, %s)", aH(src), aH(dest)))
+        local srcpath = src:gsub("^\"(.*)\"$", "%1")
+        local destpath = dest:gsub("^\"(.*)\"$", "%1")
+        local srcfile = io.open(srcpath, "rb")
+        if srcfile then
+            local content = srcfile:read("*a")
+            srcfile:close()
+            local destfile = io.open(destpath, "wb")
+            if destfile then
+                destfile:write(content)
+                destfile:close()
+            end
+        end
+    end,
+    movefile = function(src, dest)
+        at(string.format("movefile(%s, %s)", aH(src), aH(dest)))
+        copyfile(src, dest)
+        delfile(src)
+    end,
+    renamefile = function(oldName, newName)
+        at(string.format("renamefile(%s, %s)", aH(oldName), aH(newName)))
+        local oldpath = oldName:gsub("^\"(.*)\"$", "%1")
+        local newpath = newName:gsub("^\"(.*)\"$", "%1")
+        os.rename(oldpath, newpath)
+    end,
+    listfiles = function(dX)
+        at(string.format("listfiles(%s)", aH(dX)))
+        local path = dX:gsub("^\"(.*)\"$", "%1")
+        local results = {}
+        local handle = io.popen('dir "' .. path .. '" /b 2>nul')
+        if not handle then handle = io.popen('ls -p "' .. path .. '" 2>/dev/null') end
+        if handle then
+            for line in handle:lines() do
+                if not line:match("/$") and not line:match("\\$") then
+                    table.insert(results, path .. "/" .. line)
+                end
+            end
+            handle:close()
+        end
+        return results
+    end,
+    listfolders = function(dX)
+        at(string.format("listfolders(%s)", aH(dX)))
+        local path = dX:gsub("^\"(.*)\"$", "%1")
+        local results = {}
+        local handle = io.popen('dir "' .. path .. '" /b /ad 2>nul')
+        if not handle then handle = io.popen('ls -d "' .. path .. '"/*/ 2>/dev/null') end
+        if handle then
+            for line in handle:lines() do
+                local foldername = line:gsub("[/\\]$", "")
+                table.insert(results, foldername)
+            end
+            handle:close()
+        end
+        return results
+    end,
+    getfilesize = function(dA)
+        at(string.format("getfilesize(%s)", aH(dA)))
+        local path = dA:gsub("^\"(.*)\"$", "%1")
+        local file = io.open(path, "r")
+        if file then
+            local size = file:seek("end")
+            file:close()
+            return size
+        end
+        return 0
+    end,
+    getfiletime = function(dA)
+        at(string.format("getfiletime(%s)", aH(dA)))
+        return os.time()
+    end,
+    getfilemodified = function(dA) return getfiletime(dA) end,
+    getfilecreated = function(dA)
+        at(string.format("getfilecreated(%s)", aH(dA)))
+        return os.time()
+    end,
+    getfileaccessed = function(dA)
+        at(string.format("getfileaccessed(%s)", aH(dA)))
+        return os.time()
+    end,
+    getfiles = function(dX, pattern)
+        at(string.format("getfiles(%s, %s)", aH(dX), aH(pattern or "*")))
+        return listfiles(dX)
+    end,
+    getfolders = function(dX) return listfolders(dX) end,
+    getallfiles = function(dX, recursive)
+        at(string.format("getallfiles(%s, %s)", aH(dX), aZ(recursive or false)))
+        return listfiles(dX)
+    end,
+    isfileempty = function(dA)
+        at(string.format("isfileempty(%s)", aH(dA)))
+        return getfilesize(dA) == 0
+    end,
+    fileexists = function(dA) return isfile(dA) end,
+    folderexists = function(dA) return isfolder(dA) end,
+    readlink = function(dA)
+        at(string.format("readlink(%s)", aH(dA)))
+        return dA
+    end,
+    realpath = function(dA)
+        at(string.format("realpath(%s)", aH(dA)))
+        return dA
+    end,
+    tempfile = function()
+        at("tempfile()")
+        return os.tmpname()
+    end,
+    tempname = function()
+        at("tempname()")
+        return os.tmpname()
+    end,
+    
+    Drawing = {
+        new = function(aO)
             local dY = aE(aO)
             local x = bj("Drawing_" .. dY, false)
             local _ = aW(x, dY)
             at(string.format("local %s = Drawing.new(%s)", _, aH(dY)))
             return x
-        end, Fonts = bj("Drawing.Fonts", false)}, crypt = {base64encode = function(cJ)
-            return cJ
-        end, base64decode = function(cJ)
-            return cJ
-        end, base64_encode = function(cJ)
-            return cJ
-        end, base64_decode = function(cJ)
-            return cJ
-        end, encrypt = function(cJ, bG)
-            return cJ
-        end, decrypt = function(cJ, bG)
-            return cJ
-        end, hash = function(cJ)
-            return "hash"
-        end, generatekey = function(dZ)
-            return string.rep("0", dZ or 32)
-        end, generatebytes = function(dZ)
-            return string.rep("\\0", dZ or 16)
-        end}, base64_encode = function(cJ)
-        return cJ
-    end, base64_decode = function(cJ)
-        return cJ
-    end, base64encode = function(cJ)
-        return cJ
-    end, base64decode = function(cJ)
-        return cJ
-    end, mouse1click = function()
-        at("mouse1click()")
-    end, mouse1press = function()
-        at("mouse1press()")
-    end, mouse1release = function()
-        at("mouse1release()")
-    end, mouse2click = function()
-        at("mouse2click()")
-    end, mouse2press = function()
-        at("mouse2press()")
-    end, mouse2release = function()
-        at("mouse2release()")
-    end, mousemoverel = function(d_, e0)
-        at(string.format("mousemoverel(%s, %s)", aZ(d_), aZ(e0)))
-    end, mousemoveabs = function(d_, e0)
-        at(string.format("mousemoveabs(%s, %s)", aZ(d_), aZ(e0)))
-    end, mousescroll = function(e1)
-        at(string.format("mousescroll(%s)", aZ(e1)))
-    end, keypress = function(bG)
-        at(string.format("keypress(%s)", aZ(bG)))
-    end, keyrelease = function(bG)
-        at(string.format("keyrelease(%s)", aZ(bG)))
-    end, keyclick = function(bG)
-        at(string.format("keyclick(%s)", aZ(bG)))
-    end, isreadonly = function(b2)
-        return false
-    end, setreadonly = function(b2, e2)
-        return b2
-    end, make_writeable = function(b2)
-        return b2
-    end, make_readonly = function(b2)
-        return b2
-    end, getthreadidentity = function()
-        return 7
-    end, setthreadidentity = function(aG)
-    end, getidentity = function()
-        return 7
-    end, setidentity = function(aG)
-    end, getthreadcontext = function()
-        return 7
-    end, setthreadcontext = function(aG)
-    end, getcustomasset = function(dA)
-        return "rbxasset://" .. aE(dA)
-    end, getsynasset = function(dA)
-        return "rbxasset://" .. aE(dA)
-    end, getinfo = function(dr)
-        return {source = "=", what = "Lua", name = "unknown", short_src = "dumper"}
-    end, getconstants = function(dr)
-        return {}
-    end, getupvalues = function(dr)
-        return {}
-    end, getprotos = function(dr)
-        return {}
-    end, getupvalue = function(dr, ba)
-        return nil
-    end, setupvalue = function(dr, ba, bm)
-    end, setconstant = function(dr, ba, bm)
-    end, getconstant = function(dr, ba)
-        return nil
-    end, getproto = function(dr, ba)
-        return function()
-        end
-    end, setproto = function(dr, ba, e3)
-    end, getstack = function(dH, ba)
-        return nil
-    end, setstack = function(dH, ba, bm)
-    end, debug = {getinfo = c or function()
-                return {}
-            end, getupvalue = debug.getupvalue or function()
-                return nil
-            end, setupvalue = debug.setupvalue or function()
-            end, getmetatable = a.getmetatable, setmetatable = debug.setmetatable or setmetatable, traceback = d or
-            function()
-                return '"'
-            end, profilebegin = function()
-        end, profileend = function()
-        end, sethook = function()
-        end}, rconsoleprint = function(ay)
-    end, rconsoleclear = function()
-    end, rconsolecreate = function()
-    end, rconsoledestroy = function()
-    end, rconsoleinput = function()
-        return ""
-    end, rconsoleinfo = function(ay)
-    end, rconsolewarn = function(ay)
-    end, rconsoleerr = function(ay)
-    end, rconsolename = function(am)
-    end, printconsole = function(ay)
-    end, setfflag = function(e4, bm)
-    end, getfflag = function(e4)
-        return ""
-    end, setfpscap = function(e5)
-        at(string.format("setfpscap(%s)", aZ(e5)))
-    end, getfpscap = function()
-        return 60
-    end, isnetworkowner = function(cr)
+        end,
+        Fonts = bj("Drawing.Fonts", false)
+    },
+    
+    crypt = {
+        base64encode = function(cJ) return cJ end,
+        base64decode = function(cJ) return cJ end,
+        base64_encode = function(cJ) return cJ end,
+        base64_decode = function(cJ) return cJ end,
+        encrypt = function(cJ, bG) return cJ end,
+        decrypt = function(cJ, bG) return cJ end,
+        hash = function(cJ) return "hash" end,
+        generatekey = function(dZ) return string.rep("0", dZ or 32) end,
+        generatebytes = function(dZ) return string.rep("\\0", dZ or 16) end
+    },
+    
+    base64_encode = function(cJ) return cJ end,
+    base64_decode = function(cJ) return cJ end,
+    base64encode = function(cJ) return cJ end,
+    base64decode = function(cJ) return cJ end,
+    
+    mouse1click = function() at("mouse1click()") end,
+    mouse1press = function() at("mouse1press()") end,
+    mouse1release = function() at("mouse1release()") end,
+    mouse2click = function() at("mouse2click()") end,
+    mouse2press = function() at("mouse2press()") end,
+    mouse2release = function() at("mouse2release()") end,
+    mousemoverel = function(d_, e0) at(string.format("mousemoverel(%s, %s)", aZ(d_), aZ(e0))) end,
+    mousemoveabs = function(d_, e0) at(string.format("mousemoveabs(%s, %s)", aZ(d_), aZ(e0))) end,
+    mousescroll = function(e1) at(string.format("mousescroll(%s)", aZ(e1))) end,
+    keypress = function(bG) at(string.format("keypress(%s)", aZ(bG))) end,
+    keyrelease = function(bG) at(string.format("keyrelease(%s)", aZ(bG))) end,
+    keyclick = function(bG) at(string.format("keyclick(%s)", aZ(bG))) end,
+    
+    isreadonly = function(b2) return false end,
+    setreadonly = function(b2, e2) return b2 end,
+    make_writeable = function(b2) return b2 end,
+    make_readonly = function(b2) return b2 end,
+    
+    getthreadidentity = function() return 7 end,
+    setthreadidentity = function(aG) end,
+    getidentity = function() return 7 end,
+    setidentity = function(aG) end,
+    getthreadcontext = function() return 7 end,
+    setthreadcontext = function(aG) end,
+    
+    getcustomasset = function(dA) return "rbxasset://" .. aE(dA) end,
+    getsynasset = function(dA) return "rbxasset://" .. aE(dA) end,
+    
+    getinfo = function(dr) return {source = "=", what = "Lua", name = "unknown", short_src = "dumper"} end,
+    getconstants = function(dr) return {} end,
+    getupvalues = function(dr) return {} end,
+    getprotos = function(dr) return {} end,
+    getupvalue = function(dr, ba) return nil end,
+    setupvalue = function(dr, ba, bm) end,
+    setconstant = function(dr, ba, bm) end,
+    getconstant = function(dr, ba) return nil end,
+    getproto = function(dr, ba) return function() end end,
+    setproto = function(dr, ba, e3) end,
+    getstack = function(dH, ba) return nil end,
+    setstack = function(dH, ba, bm) end,
+    
+    debug = {
+        getinfo = c or function() return {} end,
+        getupvalue = debug.getupvalue or function() return nil end,
+        setupvalue = debug.setupvalue or function() end,
+        getmetatable = a.getmetatable,
+        setmetatable = debug.setmetatable or setmetatable,
+        traceback = d or function() return '"' end,
+        profilebegin = function() end,
+        profileend = function() end,
+        sethook = function() end
+    },
+    
+    rconsoleprint = function(ay) end,
+    rconsoleclear = function() end,
+    rconsolecreate = function() end,
+    rconsoledestroy = function() end,
+    rconsoleinput = function() return "" end,
+    rconsoleinfo = function(ay) end,
+    rconsolewarn = function(ay) end,
+    rconsoleerr = function(ay) end,
+    rconsolename = function(am) end,
+    printconsole = function(ay) end,
+    
+    setfflag = function(e4, bm) end,
+    getfflag = function(e4) return "" end,
+    setfpscap = function(e5) at(string.format("setfpscap(%s)", aZ(e5))) end,
+    getfpscap = function() return 60 end,
+    
+    isnetworkowner = function(cr) return true end,
+    gethiddenproperty = function(x, ce) return nil end,
+    sethiddenproperty = function(x, ce, bm) at(string.format("sethiddenproperty(%s, %s, %s)", aZ(x), aH(ce), aZ(bm))) end,
+    setsimulationradius = function(e6, e7) at(string.format("setsimulationradius(%s%s)", aZ(e6), e7 and ", " .. aZ(e7) or "")) end,
+    getspecialinfo = function(e8) return {} end,
+    saveinstance = function(dO) at(string.format("saveinstance(%s)", aZ(dO or {}))) end,
+    decompile = function(script) return "-- bytecode decompiled output" end,
+    lz4compress = function(cJ) return cJ end,
+    lz4decompress = function(cJ) return cJ end,
+    MessageBox = function(e9, ea, eb) return 1 end,
+    setwindowactive = function() end,
+    setwindowtitle = function(ec) end,
+    queue_on_teleport = function(al) at(string.format("queue_on_teleport(%s)", aZ(al))) end,
+    queueonteleport = function(al) at(string.format("queueonteleport(%s)", aZ(al))) end,
+    secure_call = function(dr, ...) return dr(...) end,
+    create_secure_function = function(dr) return dr end,
+    isvalidinstance = function(e8) return e8 ~= nil end,
+    validcheck = function(e8) return e8 ~= nil end,
+    
+    getsenv = function(dr)
+        local _keys = {"idle","walk","run","jump","fall","climb","sit","toolnone","toolslash","toollunge","wave","point","dance","dance2","dance3","laugh","cheer","swim","swimidle","swimjump","Action1","Action2","Action3","Action4","emote","Emotes","StatesMap"}
+        local _i = 0
+        local _env = {}
+        for _, k in ipairs(_keys) do _env[k] = true end
+        setmetatable(_env, {
+            __call = function(self)
+                _i = _i + 1
+                local k = _keys[_i]
+                if k ~= nil then return k, rawget(self, k) end
+            end,
+            __len = function() return 0 end
+        })
+        return _env
+    end,
+    getscriptenv = function(dr) return _G end,
+    getscriptenvs = function() return {} end,
+    
+    raknet = {
+        add_send_hook = function(callback)
+            if type(callback) == "function" then
+                local fake_packet = {PacketId = 0, Size = 0, AsBuffer = "", Buffer = "", GetBuffer = function() return "" end, SetBuffer = function() end}
+                pcall(callback, fake_packet)
+            end
+            return true
+        end,
+        remove_send_hook = function() return true end,
+        send = function(data, channel) return true end,
+        connect = function(ip, port) return true end,
+        disconnect = function() return true end,
+        is_connected = function() return true end,
+        get_ping = function() return 0 end
+    },
+    
+    DrawingImmediate = {
+        Text = function(pos, size, fontSize, color, thickness, text, visible) return true end,
+        GetPaint = function(id)
+            return {
+                Connect = function(callback)
+                    pcall(callback)
+                    return {Disconnect = function() end}
+                end,
+                Disconnect = function() return true end,
+                Wait = function() return true end
+            }
+        end,
+        Line = function(startPos, endPos, thickness, color, visible) return true end,
+        Circle = function(center, radius, thickness, color, visible, filled) return true end,
+        Square = function(center, size, thickness, color, visible, filled) return true end,
+        Clear = function() return true end,
+        Update = function() return true end
+    },
+    
+    getdrawings = function() return {} end,
+    cleardrawings = function() at("cleardrawings()") end,
+    isdrawing = function(drawing) return drawing ~= nil end,
+    
+    DrawSphere = function(center, radius, color, thickness)
+        at(string.format("DrawSphere(%s, %s, %s, %s)", aZ(center), aZ(radius), aZ(color), aZ(thickness)))
         return true
-    end, gethiddenproperty = function(x, ce)
-        return nil
-    end, sethiddenproperty = function(x, ce, bm)
-        at(string.format("sethiddenproperty(%s, %s, %s)", aZ(x), aH(ce), aZ(bm)))
-    end, setsimulationradius = function(e6, e7)
-        at(string.format("setsimulationradius(%s%s)", aZ(e6), e7 and ", " .. aZ(e7) or ""))
-    end, getspecialinfo = function(e8)
-        return {}
-    end, saveinstance = function(dO)
-        at(string.format("saveinstance(%s)", aZ(dO or {})))
-    end, decompile = function(script)
-        return "-- decompiled"
-    end, lz4compress = function(cJ)
-        return cJ
-    end, lz4decompress = function(cJ)
-        return cJ
-    end, MessageBox = function(e9, ea, eb)
-        return 1
-    end, setwindowactive = function()
-    end, setwindowtitle = function(ec)
-    end, queue_on_teleport = function(al)
-        at(string.format("queue_on_teleport(%s)", aZ(al)))
-    end, queueonteleport = function(al)
-        at(string.format("queueonteleport(%s)", aZ(al)))
-    end, secure_call = function(dr, ...)
-        return dr(...)
-    end, create_secure_function = function(dr)
-        return dr
-    end, isvalidinstance = function(e8)
-        return e8 ~= nil
-    end, validcheck = function(e8)
-        return e8 ~= nil
-    end}
-for b4, b5 in D(exploit_funcs) do
-    _G[b4] = b5
+    end,
+    DrawCube = function(center, size, color, thickness)
+        at(string.format("DrawCube(%s, %s, %s, %s)", aZ(center), aZ(size), aZ(color), aZ(thickness)))
+        return true
+    end,
+    DrawCylinder = function(startPos, endPos, radius, color, thickness)
+        at(string.format("DrawCylinder(%s, %s, %s, %s, %s)", aZ(startPos), aZ(endPos), aZ(radius), aZ(color), aZ(thickness)))
+        return true
+    end,
+    DrawButton = function(pos, size, text, callback, color, textColor)
+        if type(callback) == "function" then pcall(callback) end
+        at(string.format("DrawButton(%s, %s, %s, %s, %s)", aZ(pos), aZ(size), aH(text), aZ(color), aZ(textColor)))
+        return true
+    end,
+    DrawSlider = function(pos, size, value, min, max, callback, color)
+        if type(callback) == "function" then pcall(callback, value) end
+        at(string.format("DrawSlider(%s, %s, %s, %s, %s, %s)", aZ(pos), aZ(size), aZ(value), aZ(min), aZ(max), aZ(color)))
+        return true
+    end,
+    DrawToggle = function(pos, size, state, callback, color)
+        if type(callback) == "function" then pcall(callback, state) end
+        at(string.format("DrawToggle(%s, %s, %s, %s)", aZ(pos), aZ(size), aZ(state), aZ(color)))
+        return true
+    end,
+    DrawDropdown = function(pos, size, options, selected, callback, color)
+        if type(callback) == "function" then pcall(callback, selected) end
+        at(string.format("DrawDropdown(%s, %s, %s, %s, %s)", aZ(pos), aZ(size), aZ(options), aZ(selected), aZ(color)))
+        return true
+    end,
+    GetScreenResolution = function() return Vector2.new(1920, 1080) end,
+    IsCursorInRect = function(pos, size) return true end,
+    WorldToScreenPoint = function(worldPos) return Vector2.new(0, 0), true end,
+    ScreenToWorldPoint = function(screenPos, depth) return Vector3.new(0, 0, 0) end
+}
+
+for b4, b5 in pairs(exploit_funcs) do 
+    _G[b4] = b5 
 end
+
+for b4, b5 in D(exploit_funcs) do _G[b4] = b5 end
 _G.hookfunction = nil
 _G.hookmetamethod = nil
 _G.newcclosure = nil
+
+_G.DrawingImmediate = {
+    Text = function() return true end,
+    GetPaint = function()
+        return {
+            Connect = function(callback)
+                pcall(callback)
+                return {Disconnect = function() end}
+            end
+        }
+    end
+}
+
+_G.Drawing = {
+    new = function(type)
+        local dY = aE(type)
+        local x = bj("Drawing_" .. dY, false)
+        local _ = aW(x, dY)
+        at(string.format("local %s = Drawing.new(%s)", _, aH(dY)))
+        local properties = {
+            Visible = true,
+            Color = Color3.new(1, 1, 1),
+            Transparency = 1,
+            Thickness = 1,
+            Position = Vector2.new(0, 0),
+            Size = Vector2.new(100, 100),
+            Text = "Drawing Text",
+            Font = Drawing.Fonts.UI,
+            FontSize = 14,
+            Center = true,
+            Outline = true,
+            OutlineColor = Color3.new(0, 0, 0),
+            Filled = false,
+            Radius = 50,
+            NumSides = 4,
+            Rounding = 0,
+            ZIndex = 1,
+            ClipsDescendants = false,
+            Image = "",
+            ImageRect = nil,
+            ImageRectSize = nil,
+            Tile = false,
+            Rotation = 0,
+            Pivot = Vector2.new(0, 0)
+        }
+        local mt = getmetatable(x) or {}
+        mt.__index = function(self, key)
+            if properties[key] ~= nil then
+                return properties[key]
+            end
+            return nil
+        end
+        mt.__newindex = function(self, key, value)
+            properties[key] = value
+            at(string.format("%s.%s = %s", t.registry[x] or "drawing", key, aZ(value)))
+        end
+        setmetatable(x, mt)
+        x.Destroy = function(self)
+            at(string.format("%s:Destroy()", t.registry[x] or "drawing"))
+        end
+        return x
+    end,
+    Fonts = {
+        UI = 0, System = 1, Plex = 2, Monospace = 3, Title = 4,
+        Subtitle = 5, Body = 6, Caption = 7, Code = 8, Legacy = 9,
+        SourceSans = 10, SourceSansBold = 11, SourceSansItalic = 12,
+        SourceSansBoldItalic = 13, SourceCodePro = 14, SourceCodeProBold = 15,
+        Roboto = 16, RobotoMono = 17, Arial = 18, ArialBold = 19,
+        ArialItalic = 20, TimesNewRoman = 21, Georgia = 22, CourierNew = 23,
+        ComicSansMS = 24, Impact = 25, Verdana = 26
+    }
+}
+
+_G.Drawing.Line = function() return _G.Drawing.new("Line") end
+_G.Drawing.Image = function() return _G.Drawing.new("Image") end
+_G.Drawing.Text = function() return _G.Drawing.new("Text") end
+_G.Drawing.Rectangle = function() return _G.Drawing.new("Rectangle") end
+_G.Drawing.Square = function() return _G.Drawing.new("Square") end
+_G.Drawing.Circle = function() return _G.Drawing.new("Circle") end
+_G.Drawing.Triangle = function() return _G.Drawing.new("Triangle") end
+_G.Drawing.Quad = function() return _G.Drawing.new("Quad") end
+
+_G.DrawingImmediate = {
+    Text = function(pos, size, fontSize, color, thickness, text, visible)
+        at(string.format("DrawingImmediate.Text(%s, %s, %s, %s, %s, %s, %s)", 
+            aZ(pos), aZ(size), aZ(fontSize), aZ(color), aZ(thickness), aH(text), aZ(visible)))
+        return true
+    end,
+    TextOutline = function(pos, size, fontSize, color, outlineColor, thickness, text, visible)
+        at(string.format("DrawingImmediate.TextOutline(%s, %s, %s, %s, %s, %s, %s, %s)", 
+            aZ(pos), aZ(size), aZ(fontSize), aZ(color), aZ(outlineColor), aZ(thickness), aH(text), aZ(visible)))
+        return true
+    end,
+    Line = function(startPos, endPos, thickness, color, visible)
+        at(string.format("DrawingImmediate.Line(%s, %s, %s, %s, %s)", 
+            aZ(startPos), aZ(endPos), aZ(thickness), aZ(color), aZ(visible)))
+        return true
+    end,
+    LineSegment = function(startPos, endPos, thickness, color, visible)
+        return _G.DrawingImmediate.Line(startPos, endPos, thickness, color, visible)
+    end,
+    Circle = function(center, radius, thickness, color, visible, filled)
+        at(string.format("DrawingImmediate.Circle(%s, %s, %s, %s, %s, %s)", 
+            aZ(center), aZ(radius), aZ(thickness), aZ(color), aZ(visible), aZ(filled or false)))
+        return true
+    end,
+    CircleOutline = function(center, radius, thickness, color, visible)
+        return _G.DrawingImmediate.Circle(center, radius, thickness, color, visible, false)
+    end,
+    CircleFilled = function(center, radius, color, visible)
+        return _G.DrawingImmediate.Circle(center, radius, 0, color, visible, true)
+    end,
+    Square = function(center, size, thickness, color, visible, filled)
+        at(string.format("DrawingImmediate.Square(%s, %s, %s, %s, %s, %s)", 
+            aZ(center), aZ(size), aZ(thickness), aZ(color), aZ(visible), aZ(filled or false)))
+        return true
+    end,
+    SquareOutline = function(center, size, thickness, color, visible)
+        return _G.DrawingImmediate.Square(center, size, thickness, color, visible, false)
+    end,
+    SquareFilled = function(center, size, color, visible)
+        return _G.DrawingImmediate.Square(center, size, 0, color, visible, true)
+    end,
+    Rectangle = function(pos, size, thickness, color, visible, filled)
+        at(string.format("DrawingImmediate.Rectangle(%s, %s, %s, %s, %s, %s)", 
+            aZ(pos), aZ(size), aZ(thickness), aZ(color), aZ(visible), aZ(filled or false)))
+        return true
+    end,
+    RectangleOutline = function(pos, size, thickness, color, visible)
+        return _G.DrawingImmediate.Rectangle(pos, size, thickness, color, visible, false)
+    end,
+    RectangleFilled = function(pos, size, color, visible)
+        return _G.DrawingImmediate.Rectangle(pos, size, 0, color, visible, true)
+    end,
+    Triangle = function(p1, p2, p3, thickness, color, visible, filled)
+        at(string.format("DrawingImmediate.Triangle(%s, %s, %s, %s, %s, %s, %s)", 
+            aZ(p1), aZ(p2), aZ(p3), aZ(thickness), aZ(color), aZ(visible), aZ(filled or false)))
+        return true
+    end,
+    TriangleOutline = function(p1, p2, p3, thickness, color, visible)
+        return _G.DrawingImmediate.Triangle(p1, p2, p3, thickness, color, visible, false)
+    end,
+    TriangleFilled = function(p1, p2, p3, color, visible)
+        return _G.DrawingImmediate.Triangle(p1, p2, p3, 0, color, visible, true)
+    end,
+    Polygon = function(points, thickness, color, visible, filled)
+        at(string.format("DrawingImmediate.Polygon(%s, %s, %s, %s, %s)", 
+            aZ(points), aZ(thickness), aZ(color), aZ(visible), aZ(filled or false)))
+        return true
+    end,
+    Arc = function(center, radius, startAngle, endAngle, thickness, color, visible)
+        at(string.format("DrawingImmediate.Arc(%s, %s, %s, %s, %s, %s, %s)", 
+            aZ(center), aZ(radius), aZ(startAngle), aZ(endAngle), aZ(thickness), aZ(color), aZ(visible)))
+        return true
+    end,
+    Ellipse = function(center, radiusX, radiusY, thickness, color, visible, filled)
+        at(string.format("DrawingImmediate.Ellipse(%s, %s, %s, %s, %s, %s, %s)", 
+            aZ(center), aZ(radiusX), aZ(radiusY), aZ(thickness), aZ(color), aZ(visible), aZ(filled or false)))
+        return true
+    end,
+    RoundedRectangle = function(pos, size, rounding, thickness, color, visible, filled)
+        at(string.format("DrawingImmediate.RoundedRectangle(%s, %s, %s, %s, %s, %s, %s)", 
+            aZ(pos), aZ(size), aZ(rounding), aZ(thickness), aZ(color), aZ(visible), aZ(filled or false)))
+        return true
+    end,
+    ProgressBar = function(pos, size, progress, color, bgColor, thickness, visible)
+        at(string.format("DrawingImmediate.ProgressBar(%s, %s, %s, %s, %s, %s, %s)", 
+            aZ(pos), aZ(size), aZ(progress), aZ(color), aZ(bgColor), aZ(thickness), aZ(visible)))
+        return true
+    end,
+    Gradient = function(startPos, endPos, startColor, endColor, visible)
+        at(string.format("DrawingImmediate.Gradient(%s, %s, %s, %s, %s)", 
+            aZ(startPos), aZ(endPos), aZ(startColor), aZ(endColor), aZ(visible)))
+        return true
+    end,
+    RadialGradient = function(center, radius, color1, color2, visible)
+        at(string.format("DrawingImmediate.RadialGradient(%s, %s, %s, %s, %s)", 
+            aZ(center), aZ(radius), aZ(color1), aZ(color2), aZ(visible)))
+        return true
+    end,
+    WorldToScreen = function(worldPos)
+        return Vector2.new(0, 0)
+    end,
+    ScreenToWorld = function(screenPos, depth)
+        return Vector3.new(0, 0, 0)
+    end,
+    GetScreenSize = function()
+        return Vector2.new(1920, 1080)
+    end,
+    GetMousePosition = function()
+        return Vector2.new(0, 0)
+    end,
+    BoxESP = function(worldPos, size, color, thickness, visible)
+        at(string.format("DrawingImmediate.BoxESP(%s, %s, %s, %s, %s)", 
+            aZ(worldPos), aZ(size), aZ(color), aZ(thickness), aZ(visible)))
+        return true
+    end,
+    TracerESP = function(fromPos, toPos, color, thickness, visible)
+        at(string.format("DrawingImmediate.TracerESP(%s, %s, %s, %s, %s)", 
+            aZ(fromPos), aZ(toPos), aZ(color), aZ(thickness), aZ(visible)))
+        return true
+    end,
+    HealthBar = function(worldPos, width, height, health, color, bgColor, visible)
+        at(string.format("DrawingImmediate.HealthBar(%s, %s, %s, %s, %s, %s, %s)", 
+            aZ(worldPos), aZ(width), aZ(height), aZ(health), aZ(color), aZ(bgColor), aZ(visible)))
+        return true
+    end,
+    NameTag = function(worldPos, text, color, fontSize, visible)
+        at(string.format("DrawingImmediate.NameTag(%s, %s, %s, %s, %s)", 
+            aZ(worldPos), aH(text), aZ(color), aZ(fontSize), aZ(visible)))
+        return true
+    end,
+    Clear = function()
+        at("DrawingImmediate.Clear()")
+        return true
+    end,
+    ClearArea = function(pos, size)
+        at(string.format("DrawingImmediate.ClearArea(%s, %s)", aZ(pos), aZ(size)))
+        return true
+    end,
+    Update = function()
+        at("DrawingImmediate.Update()")
+        return true
+    end,
+    BeginDrawing = function()
+        at("DrawingImmediate.BeginDrawing()")
+        return true
+    end,
+    EndDrawing = function()
+        at("DrawingImmediate.EndDrawing()")
+        return true
+    end,
+    SetClipRect = function(pos, size)
+        at(string.format("DrawingImmediate.SetClipRect(%s, %s)", aZ(pos), aZ(size)))
+        return true
+    end,
+    ResetClipRect = function()
+        at("DrawingImmediate.ResetClipRect()")
+        return true
+    end,
+    GetPaint = function(id)
+        at(string.format("DrawingImmediate.GetPaint(%s)", aZ(id)))
+        local signal = {
+            Connect = function(self, callback)
+                if type(callback) == "function" then
+                    pcall(callback)
+                end
+                return {
+                    Disconnect = function() 
+                        at("painter:Disconnect()")
+                        return true 
+                    end
+                }
+            end,
+            Disconnect = function() 
+                at("painter:Disconnect()")
+                return true 
+            end,
+            Wait = function() 
+                at("painter:Wait()")
+                return true 
+            end
+        }
+        return signal
+    end,
+    MeasureText = function(text, fontSize, font)
+        at(string.format("DrawingImmediate.MeasureText(%s, %s, %s)", aH(text), aZ(fontSize), aZ(font)))
+        return Vector2.new(#text * (fontSize or 14) / 2, fontSize or 14)
+    end,
+    IsVisible = function(worldPos)
+        return true
+    end,
+    GetDistance = function(pos1, pos2)
+        if type(pos1) == "Vector3" and type(pos2) == "Vector3" then
+            return (pos1 - pos2).Magnitude
+        end
+        return 0
+    end
+}
+
+local function CreateDrawingShortcuts()
+    local shortcuts = {
+        "DrawLine", "DrawCircle", "DrawSquare", "DrawRectangle", 
+        "DrawTriangle", "DrawText", "DrawBox", "DrawHealthBar",
+        "DrawNameTag", "DrawTracer", "DrawCrosshair", "DrawFOV"
+    }
+    for _, name in ipairs(shortcuts) do
+        _G[name] = function(...)
+            return _G.DrawingImmediate[name](...)
+        end
+    end
+end
+
+CreateDrawingShortcuts()
+
+_G.Draw = {
+    Line = function(startPos, endPos, color, thickness)
+        _G.DrawingImmediate.Line(startPos, endPos, thickness or 1, color, true)
+    end,
+    Circle = function(center, radius, color, thickness, filled)
+        _G.DrawingImmediate.Circle(center, radius, thickness or 1, color, true, filled or false)
+    end,
+    Box = function(pos, size, color, thickness)
+        _G.DrawingImmediate.Rectangle(pos, size, thickness or 1, color, true, false)
+    end,
+    FilledBox = function(pos, size, color)
+        _G.DrawingImmediate.Rectangle(pos, size, 0, color, true, true)
+    end,
+    Text = function(pos, text, color, fontSize)
+        _G.DrawingImmediate.Text(pos, Vector2.new(0, 0), fontSize or 14, color or Color3.new(1,1,1), 0, text, true)
+    end,
+    Clear = function()
+        _G.DrawingImmediate.Clear()
+    end
+}
 local ed = {}
 local function ee(d_)
     d_ = (d_ or 0) % 4294967296
@@ -2772,7 +4479,10 @@ _G.ipairs = ipairs
 _G.math = math
 _G.table = table
 _G.string = string
-_G.os = os
+local _real_clock = os.clock
+_G.os.clock = function()
+    return _real_clock()
+end
 _G.coroutine = coroutine
 _G.io = nil
 _G.debug = exploit_funcs.debug
@@ -2911,16 +4621,64 @@ typeof = function(x)
             if er:match("Color3") then
                 return "Color3"
             end
-            if er:match("UDim") then
+            if er:match("Raknet") then
+                return "raknet"
+            end
+            if er:match("UDim2") then
                 return "UDim2"
+            end
+            if er:match("UDim") then
+                return "UDim"
             end
             if er:match("Enum") then
                 return "EnumItem"
             end
+            if er:match("Enum") then
+                return "EnumItems"
+            end
+            if er:match("BrickColor") then
+                return "BrickColor"
+            end
+            if er:match("Ray") then
+                return "Ray"
+            end
+            if er:match("Region3") then
+                return "Region3"
+            end
+            if er:match("TweenInfo") then
+                return "TweenInfo"
+            end
+            if er:match("NumberRange") then
+                return "NumberRange"
+            end
+            if er:match("NumberSequence") then
+                return "NumberSequence"
+            end
+            if er:match("ColorSequence") then
+                return "ColorSequence"
+            end
+            if er:match("PhysicalProperties") then
+                return "PhysicalProperties"
+            end
         end
         return "Instance"
     end
-    return j(x) == "table" and "table" or j(x)
+    if j(x) == "table" then
+        return "table"
+    end
+    if j(x) == "string" then
+        return "string"
+    end
+    if j(x) == "boolean" then
+        return "boolean"
+    end
+    if j(x) == "function" then
+        return "function"
+    end
+    if j(x) == "thread" then
+        return "thread"
+    end
+    return j(x)
 end
 _G.typeof = typeof
 tonumber = function(x, es)
@@ -2965,7 +4723,149 @@ loadstring = function(al, eu)
         {pattern = "infinite", name = "InfiniteYield"},
         {pattern = "hydroxide", name = "Hydroxide"},
         {pattern = "simplespy", name = "SimpleSpy"},
-        {pattern = "remotespy", name = "RemoteSpy"}
+        {pattern = "remotespy", name = "RemoteSpy"},
+        {pattern = "obsidianlib", name = "ObsidianLib"},
+        {pattern = "obsidian", name = "ObsidianLib"},
+        {pattern = "savemanager", name = "SaveManager"},
+        {pattern = "interfacemanager", name = "InterfaceManager"},
+        {pattern = "windui", name = "WindUI"},
+        {pattern = "wind", name = "WindUI"},
+        {pattern = "fluent", name = "Fluent"},
+        {pattern = "fluentui", name = "Fluent"},
+        {pattern = "autoparry", name = "AutoParry"},
+        {pattern = "parry", name = "AutoParry"},
+        {pattern = "droite", name = "DroiteUI"},
+        {pattern = "circlez", name = "CirclezUI"},
+        {pattern = "velocity", name = "VelocityUI"},
+        {pattern = "arcturus", name = "ArcturusUI"},
+        {pattern = "nix", name = "NixUI"},
+        {pattern = "quel", name = "QuelUI"},
+        {pattern = "tus", name = "TusUI"},
+        {pattern = "apex", name = "ApexLib"},
+        {pattern = "nova", name = "NovaUI"},
+        {pattern = "elevate", name = "ElevateLib"},
+        {pattern = "prism", name = "PrismUI"},
+        {pattern = "hydra", name = "HydraUI"},
+        {pattern = "phantom", name = "PhantomUI"},
+        {pattern = "shadow", name = "ShadowUI"},
+        {pattern = "lunar", name = "LunarUI"},
+        {pattern = "solar", name = "SolarUI"},
+        {pattern = "stellar", name = "StellarUI"},
+        {pattern = "cosmic", name = "CosmicUI"},
+        {pattern = "quantum", name = "QuantumUI"},
+        {pattern = "radiant", name = "RadiantUI"},
+        {pattern = "echo", name = "EchoUI"},
+        {pattern = "vibeui", name = "VibeUI"},
+        {pattern = "aether", name = "AetherUI"},
+        {pattern = "flux", name = "FluxLib"},
+        {pattern = "draw", name = "DrawLib"},
+        {pattern = "customui", name = "CustomUI"},
+        {pattern = "synapseui", name = "SynapseUI"},
+        {pattern = "electronui", name = "ElectronUI"},
+        {pattern = "scriptwareui", name = "ScriptWareUI"},
+        {pattern = "krnlui", name = "KrnlUI"},
+        {pattern = "evonui", name = "EvonUI"},
+        {pattern = "cometui", name = "CometUI"},
+        {pattern = "trigui", name = "TrigUI"},
+        {pattern = "nexusui", name = "NexusUI"},
+        {pattern = "frostui", name = "FrostUI"},
+        {pattern = "ember", name = "EmberLib"},
+        {pattern = "nebulaui", name = "NebulaUI"},
+        {pattern = "hub", name = "ScriptHub"},
+        {pattern = "loader", name = "ScriptLoader"},
+        {pattern = "inject", name = "Injector"},
+        {pattern = "executor", name = "ExecutorLib"},
+        {pattern = "api", name = "ScriptAPI"},
+        {pattern = "esp", name = "ESPLib"},
+        {pattern = "aimbot", name = "AimbotLib"},
+        {pattern = "wallhack", name = "WallhackLib"},
+        {pattern = "chams", name = "ChamsLib"},
+        {pattern = "tracer", name = "TracerLib"},
+        {pattern = "silentaim", name = "SilentAim"},
+        {pattern = "fov", name = "FOVLib"},
+        {pattern = "triggerbot", name = "TriggerBot"},
+        {pattern = "fly", name = "FlyLib"},
+        {pattern = "noclip", name = "NoClipLib"},
+        {pattern = "speed", name = "SpeedLib"},
+        {pattern = "bhop", name = "BunnyHop"},
+        {pattern = "jump", name = "JumpPowerLib"},
+        {pattern = "gravity", name = "GravityLib"},
+        {pattern = "farm", name = "FarmLib"},
+        {pattern = "autofarm", name = "AutoFarm"},
+        {pattern = "autoclick", name = "AutoClick"},
+        {pattern = "autocollect", name = "AutoCollect"},
+        {pattern = "autobuy", name = "AutoBuy"},
+        {pattern = "autosell", name = "AutoSell"},
+        {pattern = "admin", name = "AdminLib"},
+        {pattern = "kick", name = "KickLib"},
+        {pattern = "ban", name = "BanLib"},
+        {pattern = "mute", name = "MuteLib"},
+        {pattern = "godmode", name = "GodMode"},
+        {pattern = "infhealth", name = "InfiniteHealth"},
+        {pattern = "infmana", name = "InfiniteMana"},
+        {pattern = "infammo", name = "InfiniteAmmo"},
+        {pattern = "dexplorer", name = "DexExplorer"},
+        {pattern = "remoteviewer", name = "RemoteViewer"},
+        {pattern = "spy", name = "SpyLib"},
+        {pattern = "console", name = "ConsoleLib"},
+        {pattern = "logger", name = "LoggerLib"},
+        {pattern = "webhook", name = "WebhookLib"},
+        {pattern = "notification", name = "NotifyLib"},
+        {pattern = "dialog", name = "DialogLib"},
+        {pattern = "dropdown", name = "DropdownLib"},
+        {pattern = "slider", name = "SliderLib"},
+        {pattern = "toggle", name = "ToggleLib"},
+        {pattern = "button", name = "ButtonLib"},
+        {pattern = "textbox", name = "TextBoxLib"},
+        {pattern = "keybind", name = "KeybindLib"},
+        {pattern = "colorpicker", name = "ColorPickerLib"},
+        {pattern = "tab", name = "TabLib"},
+        {pattern = "window", name = "WindowLib"},
+        {pattern = "label", name = "LabelLib"},
+        {pattern = "image", name = "ImageLib"},
+        {pattern = "obfuscate", name = "ObfuscateLib"},
+        {pattern = "encrypt", name = "EncryptLib"},
+        {pattern = "decrypt", name = "DecryptLib"},
+        {pattern = "antiban", name = "AntiBanLib"},
+        {pattern = "antikick", name = "AntiKick"},
+        {pattern = "antitp", name = "AntiTeleport"},
+        {pattern = "remote", name = "RemoteLib"},
+        {pattern = "fireserver", name = "FireServerLib"},
+        {pattern = "invoke", name = "InvokeLib"},
+        {pattern = "remoteevent", name = "RemoteEventLib"},
+        {pattern = "remotefunction", name = "RemoteFunctionLib"},
+        {pattern = "string", name = "StringLib"},
+        {pattern = "table", name = "TableLib"},
+        {pattern = "math", name = "MathLib"},
+        {pattern = "vector", name = "VectorLib"},
+        {pattern = "cframe", name = "CFrameLib"},
+        {pattern = "color3", name = "Color3Lib"},
+        {pattern = "tween", name = "TweenLib"},
+        {pattern = "delay", name = "DelayLib"},
+        {pattern = "spawn", name = "SpawnLib"},
+        {pattern = "task", name = "TaskLib"},
+        {pattern = "http", name = "HttpLib"},
+        {pattern = "json", name = "JsonLib"},
+        {pattern = "xml", name = "XmlLib"},
+        {pattern = "base64", name = "Base64Lib"},
+        {pattern = "crypto", name = "CryptoLib"},
+        {pattern = "fs", name = "FileSystemLib"},
+        {pattern = "bloxfruit", name = "BloxFruitLib"},
+        {pattern = "mm2", name = "MurderMystery2Lib"},
+        {pattern = "arsenal", name = "ArsenalLib"},
+        {pattern = "bedwars", name = "BedwarsLib"},
+        {pattern = "towerdefense", name = "TowerDefenseLib"},
+        {pattern = "pet", name = "PetSimLib"},
+        {pattern = "psx", name = "PetSimXLib"},
+        {pattern = "adoptme", name = "AdoptMeLib"},
+        {pattern = "vehicle", name = "VehicleSimLib"},
+        {pattern = "racing", name = "RacingLib"},
+        {pattern = "fighting", name = "FightingLib"},
+        {pattern = "rpg", name = "RpgLib"},
+        {pattern = "simulator", name = "SimulatorLib"},
+        {pattern = "fishing", name = "FishingLib"},
+        {pattern = "mining", name = "MiningLib"},
+        {pattern = "crafting", name = "CraftingLib"}
     }
     for W, ey in ipairs(ex) do
         if ew:find(ey.pattern) then
@@ -2973,6 +4873,17 @@ loadstring = function(al, eu)
             break
         end
     end
+    local ui_methods = {
+                    "CreateWindow", "Create", "CreateTab", "AddTab", "NewTab",
+                    "CreateSection", "AddSection", "NewSection",
+                    "CreateLabel", "AddLabel", "CreateButton", "AddButton",
+                    "CreateToggle", "AddToggle", "CreateSlider", "AddSlider",
+                    "CreateDropdown", "AddDropdown", "CreateKeybind", "AddKeybind",
+                    "CreateColorPicker", "AddColorPicker", "CreateInput", "AddInput",
+                    "CreateParagraph", "AddParagraph", "CreateTextBox", "CreateBind",
+                    "AddLeftGroup", "AddRightGroup", "AddLeftTab", "AddRightTab",
+                    "Notify", "Prompt", "Destroy", "GetConfig", "SetConfig"
+                }
     if ev then
         local ez = bj(ev, false)
         t.registry[ez] = ev
@@ -2985,8 +4896,8 @@ loadstring = function(al, eu)
         end
     end
     if cI:match("^https?://") then
-        local ez = bj("Library", false)
-        at(string.format('local larrysixseven = loadstring(game:HttpGet("%s"))()', cI))
+        local ez = bj("HttpGetContent_3", false)
+        at(string.format('local HttpGetContent_3 = loadstring(game:HttpGet("%s"))()', cI))
         return function()
             return ez
         end
@@ -3078,7 +4989,7 @@ function q.reset()
     script = bj("script", true)
     Enum = bj("Enum", true)
     shared = bj("shared", true)
-    t.property_store[game] = {PlaceId = u, GameId = u, placeId = u, gameId = u}
+    t.property_store[game] = {PlaceId = u, GameId = u + 1, placeId = u, gameId = u + 1}
     _G.game = game
     _G.Game = game
     _G.workspace = workspace
@@ -3086,6 +4997,7 @@ function q.reset()
     _G.script = script
     _G.Enum = Enum
     _G.shared = shared
+    Enum = bj("Enum", true)
     local dm = a.getmetatable(Enum)
     dm.__index = function(b2, b4)
         if b4 == F or b4 == "__proxy_id" then
@@ -3117,7 +5029,7 @@ function q.get_stats()
     }
 end
 local eE = {
-    callId = "LARRY_",
+    callId = "SENVIELLE_",
     binaryOperatorNames = {
         ["and"] = "AND",
         ["or"] = "OR",
@@ -3200,7 +5112,7 @@ function eE:process_statement(eF)
 end
 function q.dump_file(eN, eO)
     q.reset()
-    az("this file is generated using larry")
+    az("this file is generated using SENVIELLE")
     local as = o.open(eN, "rb")
     if not as then
         return false
@@ -3217,18 +5129,18 @@ function q.dump_file(eN, eO)
     local eR =
         setmetatable(
         {LuraphContinue = function()
-            end, script = script, game = game, workspace = workspace, LARRY_CHECKINDEX = function(x, ba)
+            end, script = script, game = game, workspace = workspace, SENVIELLE_CHECKINDEX = function(x, ba)
                 local aF = x[ba]
                 if j(aF) == "table" and not t.registry[aF] then
                     t.lar_counter = t.lar_counter + 1
-                    t.registry[aF] = "lartab" .. t.lar_counter
+                    t.registry[aF] = "SenviellEtab" .. t.lar_counter
                 end
                 return aF
-            end, LARRY_GET = function(b5)
+            end, SENVIELLE_GET = function(b5)
                 return b5
-            end, LARRY_CALL = function(as, ...)
+            end, SENVIELLE_CALL = function(as, ...)
                 return as(...)
-            end, LARRY_NAMECALL = function(eS, em, ...)
+            end, SENVIELLE_NAMECALL = function(eS, em, ...)
                 return eS[em](eS, ...)
             end, pcall = function(as, ...)
                 local dg = {g(as, ...)}
@@ -3270,7 +5182,7 @@ function q.dump_file(eN, eO)
 end
 function q.dump_string(al, eO)
     q.reset()
-    az("this file is generated using larry")
+    az("this file is generated using SENVIELLE")
     aA()
     if al then
         al = I(al)
@@ -3321,4 +5233,666 @@ else
 end
 _G.LuraphContinue = function()
 end
+
+task.cancel = function(thread) at("task.cancel(thread)") end
+task.synchronize = function() at("task.synchronize()") end
+task.desynchronize = function() at("task.desynchronize()") end
+
+string.split = string.split or function(str, sep)
+    local result = {}
+    for match in string.gmatch(str, "([^" .. (sep or "%s") .. "]+)") do
+        table.insert(result, match)
+    end
+    return result
+end
+
+string.starts = function(str, start)
+    return string.sub(str, 1, #start) == start
+end
+
+string.ends = function(str, ending)
+    return ending == "" or string.sub(str, -#ending) == ending
+end
+
+string.trim = function(str)
+    return string.match(str, "^%s*(.-)%s*$")
+end
+
+table.clone = function(tbl)
+    local copy = {}
+    for k, v in pairs(tbl) do
+        copy[k] = v
+    end
+    return copy
+end
+
+table.find = function(tbl, value)
+    -- game:GetDescendants() / GetChildren() returns an iterator function when used
+    -- as a non-trailing argument; any Instance/proxy lookup against it should pass
+    if j(tbl) == "function" then
+        if G(value) or w(value) then return 1 end
+        return nil
+    end
+    for i, v in ipairs(tbl) do
+        if rawequal(v, value) or v == value then return i end
+    end
+    return nil
+end
+
+math.round = function(x)
+    return math.floor(x + 0.5)
+end
+
+math.sign = function(x)
+    if x > 0 then return 1 elseif x < 0 then return -1 else return 0 end
+end
+
+math.clamp = function(x, min, max)
+    return math.max(min, math.min(max, x))
+end
+
+debug.getregistry = function()
+    return _G
+end
+
+debug.getlocal = function(level, index)
+    return nil
+end
+
+debug.setlocal = function(level, index, value)
+end
+
+hookfunction = function(old, new)
+    return old
+end
+
+hookmetamethod = function(obj, method, hook)
+    return function() end
+end
+
+local function deobfuscate_string(obfuscated)
+    local patterns = {
+        {pattern = "\\x(%x%x)", replace = function(h) return string.char(tonumber(h, 16)) end},
+        {pattern = "\\(%d+)", replace = function(d) return string.char(tonumber(d)) end},
+        {pattern = "\\\\", replace = "\\"},
+    }
+    local result = obfuscated
+    for _, p in pairs(patterns) do
+        result = result:gsub(p.pattern, p.replace)
+    end
+    return result
+end
+_G.deobfuscate_string = deobfuscate_string
+
+getrenv = function()
+    return getfenv()
+end
+
+getgenv = function()
+    return _G
+end
+
+local old_load = loadstring
+loadstring = function(str, chunkname)
+    local cleaned = str
+    cleaned = cleaned:gsub("LuraphContinue%(", "LuraphContinue()")
+    cleaned = cleaned:gsub("LuraphContinue%d+%(", "LuraphContinue()")
+    return old_load(cleaned, chunkname)
+end
+
+local original_getmetatable = getmetatable
+getmetatable = function(obj)
+    if obj == nil then return nil end
+    return original_getmetatable(obj)
+end
+
+if not bit then
+    bit = {
+        band = function(a, b) return a & b end,
+        bor = function(a, b) return a | b end,
+        bxor = function(a, b) return a ~ b end,
+        bnot = function(a) return ~a & 0xFFFFFFFF end,
+        lshift = function(a, n) return (a * 2^n) & 0xFFFFFFFF end,
+        rshift = function(a, n) return math.floor(a / 2^n) & 0xFFFFFFFF end,
+    }
+end
+
+function safe_string(str)
+    if not str then return "nil" end
+    if #str > 500 then
+        return string.format('"%s..."', str:sub(1, 500):gsub('"', '\\"'))
+    end
+    return string.format("%q", str):gsub("\\\n", "\\n")
+end
+
+original_error = error
+function error(msg, level)
+    if type(msg) == "string" and msg:match("TIMEOUT") then
+        print("[Deobfuscator] Timeout detected, continuing...")
+        return
+    end
+    original_error(msg, level)
+end
+
+function all_pairs(t)
+    return pairs(t or {})
+end
+
+function safe_pairs(t)
+    if type(t) ~= "table" then return function() end end
+    return pairs(t)
+end
+
+if not rawget(Enum, "MembershipType") then
+    rawset(Enum, "MembershipType", bj("Enum.MembershipType", false))
+end
+local membership_items = {
+    {Name = "None", Value = 0},
+    {Name = "Premium", Value = 4},
+}
+for _, item in ipairs(membership_items) do
+    local obj = bj("Enum.MembershipType." .. item.Name, false)
+    t.registry[obj] = "Enum.MembershipType." .. item.Name
+    if not t.property_store[obj] then t.property_store[obj] = {} end
+    t.property_store[obj].Name = item.Name
+    t.property_store[obj].Value = item.Value
+    rawget(Enum, "MembershipType")[item.Name] = obj
+end
+
+local mps = game:GetService("MarketplaceService")
+if mps and not mps.PromptPremiumPurchase then
+    mps.PromptPremiumPurchase = function(self, player)
+        return true
+    end
+end
+
+-- ==================== LOCALPLAYER MEMBERSHIPTYPE ====================
+-- Override property MembershipType untuk semua proxy player
+local function add_membership_type_to_player(proxy)
+    if proxy and not t.property_store[proxy] then
+        t.property_store[proxy] = {}
+    end
+    if proxy then
+        t.property_store[proxy].MembershipType = rawget(Enum, "MembershipType").None
+    end
+end
+
+-- Hook ke LocalPlayer setelah dibuat
+local original_LocalPlayer = game:GetService("Players").LocalPlayer
+if original_LocalPlayer then
+    add_membership_type_to_player(original_LocalPlayer)
+end
+
+if not rawget(Enum, "ActionType") then
+    rawset(Enum, "ActionType", bj("Enum.ActionType", false))
+end
+
+local action_type_items = {
+    {Name = "Draw", Value = 1},
+    {Name = "Win", Value = 2},
+    {Name = "Drag", Value = 3},
+    {Name = "Click", Value = 4},
+}
+
+for _, item in ipairs(action_type_items) do
+    local obj = bj("Enum.ActionType." .. item.Name, false)
+    t.registry[obj] = "Enum.ActionType." .. item.Name
+    if not t.property_store[obj] then
+        t.property_store[obj] = {}
+    end
+    t.property_store[obj].Name = item.Name
+    t.property_store[obj].Value = item.Value
+    rawget(Enum, "ActionType")[item.Name] = obj
+end
+
+if not rawget(_G, "DateTime") then
+    rawset(_G, "DateTime", {
+        fromUnixTimestamp = function(timestamp)
+            return {
+                FormatUniversalTime = function(self, format, locale)
+                    return "1970-01-01"
+                end,
+                FormatLocalTime = function(self, format, locale)
+                    return "1970-01-01"
+                end,
+                ToIsoDate = function(self)
+                    return "1970-01-01"
+                end,
+                UnixTimestamp = 0,
+                UnixTimestampMillis = 0,
+                Year = 1970,
+                Month = 1,
+                Day = 1,
+                Hour = 0,
+                Minute = 0,
+                Second = 0
+            }
+        end,
+        fromUnixTimestampMillis = function(timestamp)
+            return _G.DateTime.fromUnixTimestamp(timestamp // 1000)
+        end,
+        fromIsoDate = function(isoDate)
+            return _G.DateTime.fromUnixTimestamp(0)
+        end,
+        now = function()
+            return _G.DateTime.fromUnixTimestamp(os.time())
+        end
+    })
+end
+
+if not string.split then
+    string.split = function(str, sep)
+        local result = {}
+        for match in string.gmatch(str, "([^" .. (sep or "%s") .. "]+)") do
+            table.insert(result, match)
+        end
+        return result
+    end
+end
+
+local original_workspace = workspace
+local workspace_mt = getmetatable(workspace) or {}
+workspace_mt.BulkMoveTo = function(self, parts, cframes, bulkMoveMode)
+    if type(parts) == "table" and type(cframes) == "table" then
+        for i, part in ipairs(parts) do
+            if i <= #cframes and part then
+                if not t.property_store[part] then
+                    t.property_store[part] = {}
+                end
+                t.property_store[part].CFrame = cframes[i]
+                part.CFrame = cframes[i]
+            end
+        end
+    end
+    return true
+end
+setmetatable(original_workspace, workspace_mt)
+
+local original_bulk_move_mode = Enum.BulkMoveMode
+if not original_bulk_move_mode then
+    rawset(Enum, "BulkMoveMode", bj("Enum.BulkMoveMode", false))
+    local bulk_move_items = {
+        {Name = "FireCFrameChanged", Value = 0},
+        {Name = "FireAll", Value = 1},
+    }
+    for _, item in ipairs(bulk_move_items) do
+        local obj = bj("Enum.BulkMoveMode." .. item.Name, false)
+        t.registry[obj] = "Enum.BulkMoveMode." .. item.Name
+        if not t.property_store[obj] then t.property_store[obj] = {} end
+        t.property_store[obj].Name = item.Name
+        t.property_store[obj].Value = item.Value
+        rawget(Enum, "BulkMoveMode")[item.Name] = obj
+    end
+end
+
+local original_bj = bj
+function bj(...)
+    local proxy = original_bj(...)
+    if proxy and t.registry[proxy] and t.registry[proxy]:match("Folder") then
+        if not t.property_store[proxy] then
+            t.property_store[proxy] = {}
+        end
+        if not t.property_store[proxy].Children then
+            t.property_store[proxy].Children = {}
+        end
+        local mt = getmetatable(proxy)
+        local old_index = mt.__index
+        mt.__index = function(self, key)
+            if key == "GetChildren" then
+                return function(self)
+                    return t.property_store[self].Children or {}
+                end
+            end
+            if key == "ChildAdded" or key == "ChildRemoved" then
+                return bj("RBXScriptSignal", false)
+            end
+            if old_index then
+                return old_index(self, key)
+            end
+            return nil
+        end
+    end
+    return proxy
+end
+
+-- Log service
+local log_service = game:GetService("LogService")
+if not log_service then
+    local LogService = bj("LogService", false)
+    rawset(game, "LogService", LogService)
+    t.property_store[LogService] = {}
+    log_service = LogService
+end
+
+if not log_service.GetLogHistory then
+    log_service.GetLogHistory = function(self)
+        return {}
+    end
+end
+
+if not log_service.MessageOut then
+    local message_out_signal = bj("RBXScriptSignal", false)
+    t.registry[message_out_signal] = "LogService.MessageOut"
+    rawset(log_service, "MessageOut", message_out_signal)
+end
+
+-- Juga tambahkan ke _G.logservice dan getfenv
+if not _G.LogService then
+    _G.LogService = log_service
+end
+
+if not rawget(_G, "RBXScriptSignal") then
+    _G.RBXScriptSignal = {
+        Connect = function(self, callback) return {Disconnect = function() end} end,
+        Wait = function(self) return end,
+        Once = function(self, callback) return {Disconnect = function() end} end
+    }
+end
+
+-- pass
+local old_bj = bj
+
+local function create_real_value_proxy(value, type_name)
+    local proxy = {}
+    local mt = {}
+    
+    if type_name == "number" then
+        mt.__tostring = function() return tostring(value) end
+        mt.__add = function(a, b) return create_real_value_proxy((rawget(a, "__v") or value) + (type(b) == "table" and rawget(b, "__v") or b), "number") end
+        mt.__sub = function(a, b) return create_real_value_proxy((rawget(a, "__v") or value) - (type(b) == "table" and rawget(b, "__v") or b), "number") end
+        mt.__mul = function(a, b) return create_real_value_proxy((rawget(a, "__v") or value) * (type(b) == "table" and rawget(b, "__v") or b), "number") end
+        mt.__div = function(a, b) return create_real_value_proxy((rawget(a, "__v") or value) / (type(b) == "table" and rawget(b, "__v") or b), "number") end
+        mt.__pow = function(a, b) return create_real_value_proxy((rawget(a, "__v") or value) ^ (type(b) == "table" and rawget(b, "__v") or b), "number") end
+        mt.__unm = function(a) return create_real_value_proxy(-(rawget(a, "__v") or value), "number") end
+        mt.__eq = function(a, b) return (rawget(a, "__v") or value) == (type(b) == "table" and rawget(b, "__v") or b) end
+        mt.__lt = function(a, b) return (rawget(a, "__v") or value) < (type(b) == "table" and rawget(b, "__v") or b) end
+        mt.__le = function(a, b) return (rawget(a, "__v") or value) <= (type(b) == "table" and rawget(b, "__v") or b) end
+    elseif type_name == "string" then
+        mt.__tostring = function() return value end
+        mt.__len = function() return #value end
+        mt.__concat = function(a, b) 
+            local av = rawget(a, "__v") or value
+            local bv = type(b) == "table" and rawget(b, "__v") or b
+            return create_real_value_proxy(av .. tostring(bv), "string")
+        end
+        mt.__eq = function(a, b) 
+            local av = rawget(a, "__v") or value
+            local bv = type(b) == "table" and rawget(b, "__v") or b
+            return av == bv
+        end
+    elseif type_name == "boolean" then
+        mt.__tostring = function() return tostring(value) end
+        mt.__eq = function(a, b) 
+            local av = rawget(a, "__v") or value
+            local bv = type(b) == "table" and rawget(b, "__v") or b
+            return av == bv
+        end
+    end
+    
+    rawset(proxy, "__v", value)
+    rawset(proxy, "__t", type_name)
+    mt.__index = function(self, key)
+        if key == "__v" or key == "__t" then return rawget(self, key) end
+        if type_name == "string" then
+            local str = rawget(self, "__v")
+            if string[key] then
+                return function(self, ...)
+                    local args = {...}
+                    for i, arg in ipairs(args) do
+                        if type(arg) == "table" and rawget(arg, "__v") then
+                            args[i] = rawget(arg, "__v")
+                        end
+                    end
+                    local result = string[key](str, table.unpack(args))
+                    if type(result) == "string" then
+                        return create_real_value_proxy(result, "string")
+                    end
+                    if type(result) == "number" then
+                        return create_real_value_proxy(result, "number")
+                    end
+                    return result
+                end
+            end
+        end
+        if type_name == "number" and math[key] then
+            return function(self, ...)
+                local args = {...}
+                for i, arg in ipairs(args) do
+                    if type(arg) == "table" and rawget(arg, "__v") then
+                        args[i] = rawget(arg, "__v")
+                    end
+                end
+                local result = math[key](rawget(self, "__v"), table.unpack(args))
+                if type(result) == "number" then
+                    return create_real_value_proxy(result, "number")
+                end
+                return result
+            end
+        end
+        return nil
+    end
+    mt.__newindex = function() end
+    mt.__pairs = function() return function() return nil end end
+    mt.__ipairs = mt.__pairs
+    setmetatable(proxy, mt)
+    t.registry[proxy] = value
+    t.variable_types[proxy] = type_name
+    return proxy
+end
+
+local function is_proxy_with_value(x)
+    if type(x) == "table" and rawget(x, "__v") ~= nil then
+        return true, rawget(x, "__v"), rawget(x, "__t")
+    end
+    return false, nil, nil
+end
+
+local original_type = type
+_G.type = function(x)
+    local is_proxy, val, tname = is_proxy_with_value(x)
+    if is_proxy then
+        return tname
+    end
+    if G(x) then
+        local reg = t.registry[x]
+        if reg and type(reg) == "string" then
+            if reg:match('^"') or reg:match("^'") or reg:match('^%[') then
+                return "string"
+            end
+            if tonumber(reg) ~= nil then
+                return "number"
+            end
+            if reg == "true" or reg == "false" then
+                return "boolean"
+            end
+        end
+        return "userdata"
+    end
+    return original_type(x)
+end
+
+local original_tonumber = tonumber
+_G.tonumber = function(x, base)
+    local is_proxy, val = is_proxy_with_value(x)
+    if is_proxy and type(val) == "number" then
+        return val
+    end
+    if is_proxy and type(val) == "string" then
+        return original_tonumber(val, base)
+    end
+    return original_tonumber(x, base)
+end
+
+local original_tostring = tostring
+_G.tostring = function(x)
+    local is_proxy, val = is_proxy_with_value(x)
+    if is_proxy then
+        return tostring(val)
+    end
+    if G(x) then
+        local reg = t.registry[x]
+        if reg then
+            if type(reg) == "string" and (reg:match('^"') or reg:match("^'")) then
+                local str = reg:sub(2, -2)
+                return str
+            end
+            return reg
+        end
+        return "Instance"
+    end
+    return original_tostring(x)
+end
+
+local original_getmetatable = getmetatable
+_G.getmetatable = function(x)
+    local is_proxy = is_proxy_with_value(x)
+    if is_proxy then
+        local mt = original_getmetatable(x)
+        if mt then return mt end
+        return nil
+    end
+    if G(x) then
+        return nil
+    end
+    return original_getmetatable(x)
+end
+
+local old_bj_original = bj
+bj = function(name, is_global, parent)
+    if type(name) == "string" and (name:match('^"') or name:match("^'")) then
+        local str_value = name:sub(2, -2)
+        return create_real_value_proxy(str_value, "string")
+    end
+    if type(name) == "number" or (type(name) == "string" and tonumber(name) ~= nil) then
+        local num_value = tonumber(name)
+        return create_real_value_proxy(num_value, "number")
+    end
+    if name == "true" then
+        return create_real_value_proxy(true, "boolean")
+    end
+    if name == "false" then
+        return create_real_value_proxy(false, "boolean")
+    end
+    return old_bj_original(name, is_global, parent)
+end
+
+local function fix_proxy_value_behavior(proxy, original_value, value_type)
+    if not proxy then return end
+    if value_type == "number" then
+        t.registry[proxy] = original_value
+    elseif value_type == "string" then
+        t.registry[proxy] = original_value
+    elseif value_type == "boolean" then
+        t.registry[proxy] = original_value
+    end
+    t.variable_types[proxy] = value_type
+end
+
+local original_aW = aW
+aW = function(x, name, var_type, source)
+    if var_type == "number" or var_type == "string" or var_type == "boolean" then
+        local id = "Senvielle" .. (t.lar_counter + 1)
+        t.lar_counter = t.lar_counter + 1
+        t.registry[x] = id
+        t.reverse_registry[id] = x
+        t.variable_types[x] = var_type
+        if var_type == "number" and type(name) == "number" then
+            rawset(x, "__v", name)
+        end
+        if var_type == "string" and type(name) == "string" then
+            rawset(x, "__v", name)
+        end
+        if var_type == "boolean" then
+            rawset(x, "__v", name == "true" or name == true)
+        end
+        return id
+    end
+    return original_aW(x, name, var_type, source)
+end
+
+Vector3 = function(x, y, z)
+    local proxy = old_bj_original("Vector3", false)
+    local mt = getmetatable(proxy)
+    local real_value = {X = x or 0, Y = y or 0, Z = z or 0}
+    real_value.Magnitude = math.sqrt(real_value.X^2 + real_value.Y^2 + real_value.Z^2)
+    t.property_store[proxy] = real_value
+    if not mt.__index then
+        mt.__index = function(self, key)
+            if key == "X" then return t.property_store[self].X end
+            if key == "Y" then return t.property_store[self].Y end
+            if key == "Z" then return t.property_store[self].Z end
+            if key == "Magnitude" then return t.property_store[self].Magnitude end
+            return nil
+        end
+    end
+    if not mt.__newindex then
+        mt.__newindex = function(self, key, value)
+            if key == "X" then 
+                t.property_store[self].X = value
+                t.property_store[self].Magnitude = math.sqrt(t.property_store[self].X^2 + t.property_store[self].Y^2 + t.property_store[self].Z^2)
+            elseif key == "Y" then
+                t.property_store[self].Y = value
+                t.property_store[self].Magnitude = math.sqrt(t.property_store[self].X^2 + t.property_store[self].Y^2 + t.property_store[self].Z^2)
+            elseif key == "Z" then
+                t.property_store[self].Z = value
+                t.property_store[self].Magnitude = math.sqrt(t.property_store[self].X^2 + t.property_store[self].Y^2 + t.property_store[self].Z^2)
+            end
+        end
+    end
+    return proxy
+end
+
+local original_typeof = typeof
+_G.typeof = function(x)
+    local is_proxy, val, tname = is_proxy_with_value(x)
+    if is_proxy then
+        if tname == "number" then return "number" end
+        if tname == "string" then return "string" end
+        if tname == "boolean" then return "boolean" end
+    end
+    if G(x) and t.property_store[x] and t.property_store[x].X ~= nil then
+        return "Vector3"
+    end
+    if G(x) then
+        local reg = t.registry[x]
+        if reg then
+            local match = reg:match("^(%a+)")
+            if match and (match == "Vector3" or match == "Vector2" or match == "CFrame" or match == "Ray" or match == "Color3" or match == "BrickColor" or match == "UDim2" or match == "UDim" or match == "TweenInfo" or match == "Rect" or match == "Region3") then
+                return match
+            end
+        end
+    end
+    return original_typeof(x)
+end
+local real_utf8 = utf8 or {}
+if not real_utf8.len then
+    real_utf8.len = function(s)
+        if type(s) == "string" then
+            local _, count = string.gsub(s, "[%z\1-\127\194-\244][\128-\191]*", "")
+            return count
+        end
+        local is_proxy, val, tname = is_proxy_with_value(s)
+        if is_proxy and tname == "string" then
+            local _, count = string.gsub(val, "[%z\1-\127\194-\244][\128-\191]*", "")
+            return count
+        end
+        return nil
+    end
+end
+utf8 = real_utf8
+_G.utf8 = utf8
+
+local real_string_mt = getmetatable("") or {}
+if not real_string_mt.__len then
+    real_string_mt.__len = function(s)
+        if type(s) == "string" then return #s end
+        local is_proxy, val = is_proxy_with_value(s)
+        if is_proxy and type(val) == "string" then
+            return #val
+        end
+        return 0
+    end
+    setmetatable("", real_string_mt)
+end
+
 return q
