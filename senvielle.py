@@ -3,6 +3,7 @@ from discord.ext import commands
 import requests
 import os
 import io
+import tempfile
 import sys
 import urllib.parse
 import subprocess
@@ -13,6 +14,8 @@ import asyncio
 import functools
 import ipaddress
 import socket
+import random
+import string
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -26,7 +29,7 @@ def serve_index():
     return send_from_directory('.', 'index.html')
 
 def run_flask():
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=5000)
 
 # --- Lanzar Flask en segundo plano, así el bot sigue funcionando ---
 flask_thread = threading.Thread(target=run_flask)
@@ -51,7 +54,7 @@ TOKEN = "your token"
 
 PREFIX = "."
 CATMIO_INVITE  = "https://discord.gg/JzUgsbUFNp"
-DUMPER_PATH = "sennv.lua"
+DUMPER_PATH = "asenv_dump.lua"
 
 MAX_FILE_SIZE = 5 * 1024 * 1024
 DUMP_TIMEOUT = 130  # Must exceed catlogger.lua TIMEOUT_SECONDS (120) to allow proper cleanup
@@ -1388,7 +1391,7 @@ async def _get_content(ctx, link=None):
         r = await loop.run_in_executor(_executor, functools.partial(_requests_get, att.url))
         if r.status_code == 200 and r.content:
             return r.content, att.filename, None
-        return None, att.filename, f"Failed to download attachment (HTTP {r.status_code})"
+        return None, att.filename, f"Failed to fetching.... attachment (HTTP {r.status_code})"
 
     # 2. Explicit URL provided in the command argument.
     if link:
@@ -1534,6 +1537,7 @@ async def run_dumper(lua_content):
 # ---------------- EVENTS ----------------
 @bot.event
 async def on_ready():
+    bot.start_time = time.time()
     print(f"Logged as {bot.user} | Lua {_lua_interp} | -E {'yes' if _lua_has_E else 'no'}")
     log.info("Ready: %s | guilds=%d | lua=%s -E=%s", bot.user, len(bot.guilds), _lua_interp, _lua_has_E)
 
@@ -1548,6 +1552,23 @@ async def on_command_error(ctx, error):
     log.error("Unhandled error cmd=%s user=%s: %s", ctx.command, ctx.author, error, exc_info=error)
     raise error
 
+# ---------------- COMMAND .isup ----------------
+@bot.command(name="on")
+async def isup(ctx):
+    """Check bot status, uptime and ping."""
+    ping_ms = round(bot.latency * 1000)
+    start = getattr(bot, "start_time", time.time())
+    elapsed = int(time.time() - start)
+    h = elapsed // 3600
+    m = (elapsed % 3600) // 60
+    s = elapsed % 60
+    msg = f"Online — uptime: {h}h {m}m {s}s — ping: {ping_ms}ms"
+    try:
+        await _send_with_retry(lambda: ctx.send(msg))
+    except discord.errors.DiscordServerError as e:
+        print(f"Warning: failed to send isup message: {e}")
+
+
 # ---------------- COMMAND .help ----------------
 @bot.command(name="help")
 async def show_help(ctx):
@@ -1559,6 +1580,7 @@ async def show_help(ctx):
         f"`{PREFIX}get [link]` — fetch a file from a URL and send it as attachment",
         f"`{PREFIX}bf [link]` — beautify/reformat a Lua script",
         f"`{PREFIX}darklua [link]` — apply Lua code transformations interactively",
+        f"`{PREFIX}isup` — check bot status, uptime and ping",
         "",
         "Attach a file, provide a URL, or reply to a message that contains one.",
     ]
@@ -1569,7 +1591,7 @@ async def show_help(ctx):
 
 
 # ---------------- COMMAND .l ----------------
-@bot.command(name="l2")
+@bot.command(name="env")
 async def lua(ctx, *, link=None):
 
     log.info(".l user=%s guild=%s", ctx.author, ctx.guild.id if ctx.guild else "DM")
@@ -1578,13 +1600,13 @@ async def lua(ctx, *, link=None):
     if remaining > 0:
         log.info("Rate limited user=%s cmd=%s remaining=%.1fs", ctx.author, ctx.command, remaining)
         try:
-            await ctx.send(f"slow down, wait {remaining:.1f}s")
+            await ctx.send(f"slow down bro, wait {remaining:.1f}s")
         except discord.errors.DiscordServerError:
             pass
         return
 
     try:
-        status = await _send_with_retry(lambda: ctx.send("dumping"))
+        status = await _send_with_retry(lambda: ctx.send("hiii;>"))
     except discord.errors.DiscordServerError as e:
         print(f"Warning: failed to send status message: {e}")
         return
@@ -1609,7 +1631,7 @@ async def lua(ctx, *, link=None):
         _lunr_src = content.decode('utf-8', errors='ignore')
         _lunr_ver = _detect_lunr(_lunr_src)
         if _lunr_ver:
-            await status.edit(content=f"Lunr v{_lunr_ver} detected – stripping dead code...")
+            await status.edit(content=f"Lunr v{_lunr_ver} detect - waittt")
             _lunr_cleaned = _apply_lunr_preprocessing(_lunr_src)
             if _lunr_cleaned != _lunr_src:
                 content = _lunr_cleaned.encode('utf-8')
@@ -1707,18 +1729,20 @@ async def lua(ctx, *, link=None):
 
     log.info(".l done user=%s file=%s size=%d exec=%.0fms paste=%s",
              ctx.author, original_filename, len(dumped_text), exec_ms, raw or "none")
-    msg_content = f"done in {exec_ms:.2f}ms"
+    bot_name = bot.user.display_name if bot.user else "me"
     if raw:
-        msg_content += f" | {raw}"
+        msg_content = f"has been dump in {exec_ms:.2f}ms by {bot_name} | {raw}"
     else:
-        msg_content += " | paste upload failed"
+        msg_content = f"has been dump in {exec_ms:.2f}ms by {bot_name} | paste upload failed"
+
+    rand_name = ''.join(random.choices(string.ascii_letters + string.digits, k=10)) + ".lua"
 
     try:
         await _send_with_retry(lambda: ctx.send(
             content=msg_content,
             file=discord.File(
                 io.BytesIO(dumped_text.encode("utf-8")),
-                filename=original_filename+".txt"
+                filename=rand_name
             )
         ))
     except discord.errors.DiscordServerError as e:
@@ -2824,7 +2848,7 @@ async def darklua_cmd(ctx, *, link=None):
         return
 
     try:
-        status = await _send_with_retry(lambda: ctx.send("downloading"))
+        status = await _send_with_retry(lambda: ctx.send("fetching...."))
     except discord.errors.DiscordServerError as e:
         print(f"Warning: failed to send status message: {e}")
         return
@@ -2870,7 +2894,7 @@ async def darklua_cmd(ctx, *, link=None):
 async def get_link_content(ctx, *, link=None):
 
     try:
-        status = await _send_with_retry(lambda: ctx.send("downloading"))
+        status = await _send_with_retry(lambda: ctx.send("fetching..."))
     except discord.errors.DiscordServerError as e:
         print(f"Warning: failed to send status message: {e}")
         return
@@ -2924,6 +2948,222 @@ async def get_link_content(ctx, *, link=None):
         except discord.errors.HTTPException:
             pass
 
+@bot.command(name='fc', aliases=['femboy'])
+async def femboy_deobfuscate(ctx):
+    """Deobfuscate FemboyScator protected scripts"""
+    print(f"[DEBUG] Processing .fc command for {ctx.author}")
+    attachments = ctx.message.attachments
+    content = None
+    attachment = None
+    
+    message_content = ctx.message.content
+    command_prefix = '.fc' if message_content.startswith('.fc') else '.femboy'
+    link_text = message_content[len(command_prefix):].strip()
+    
+    def extract_first_url(text):
+        patterns = [
+            r'game:HttpGet\(["\']?(https?://[^"\')\s]+)["\']?\)',
+            r'["\'`](https?://[^"\')\s]+)["\'`]',
+            r'(?:^|\s)(https?://[^\s"\')\]\}]+)(?=\s|$)',
+            r'<(https?://[^>\s]+)>',
+            r'\[(https?://[^\]\s]+)\]',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                url = match.group(1)
+                url = url.rstrip('.,;:!?)')
+                url = url.strip('\'"`<>[]')
+                return url
+        
+        basic_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        match = re.search(basic_pattern, text)
+        if match:
+            return match.group(0).rstrip('.,;:!?)')
+        
+        return None
+    
+    if link_text:
+        extracted_link = extract_first_url(link_text)
+        if extracted_link:
+            try:
+                def fetch_url(url):
+                    return fetch_with_roblox_headers(url)
+                content = await asyncio.to_thread(fetch_url, extracted_link)
+            except Exception as e:
+                await ctx.reply(f"❌ Failed to fetch content from link: {e}")
+                return
+    elif not attachments and ctx.message.reference:
+        try:
+            replied_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            attachments = replied_msg.attachments
+            if not attachments:
+                extracted_link = extract_first_url(replied_msg.content)
+                if extracted_link:
+                    def fetch_url(url):
+                        return fetch_with_roblox_headers(url)
+                    content = await asyncio.to_thread(fetch_url, extracted_link)
+        except Exception as e:
+            print(f"[DEBUG] Failed to fetch replied message: {e}")
+    
+    if not content and not attachments:
+        extracted_link = extract_first_url(link_text)
+        if extracted_link:
+            try:
+                def fetch_url(url):
+                    return fetch_with_roblox_headers(url)
+                content = await asyncio.to_thread(fetch_url, extracted_link)
+            except Exception as e:
+                await ctx.reply(f"❌ Failed to fetch content from extracted link: {e}")
+                return
+
+    if not content and attachments:
+        attachment = attachments[0]
+        if not attachment.filename.lower().endswith(('.lua', '.txt')):
+            await ctx.reply("❌ Only `.lua` or `.txt` files are allowed.")
+            return
+        content = await attachment.read()
+
+    if not content:
+        await ctx.reply("❌ Please attach a file, reply to one, or provide a link (e.g., `.fc <URL>`).")
+        return
+
+    status_msg = await ctx.reply("🎀 Processing FemboyScator...")
+    start_time = time.perf_counter()
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.lua', mode='wb') as temp:
+            temp.write(content)
+            temp_path = temp.name
+        
+        try:
+            process = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    'node', '--max-old-space-size=8192', 'lua_bridge_enhanced.js', temp_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                ),
+                timeout=15
+            )
+        except asyncio.TimeoutError:
+            await status_msg.edit(content="❌ Script execution timed out (15s).")
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+            return
+        
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=1000000)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            await status_msg.edit(content="❌ Script execution timed out during processing.")
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+            return
+        
+        stdout = stdout_bytes.decode()
+        stderr = stderr_bytes.decode()
+        
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+
+        if process.returncode != 0:
+            error_msg = stderr or "Unknown error"
+            if "JavaScript heap out of memory" in error_msg:
+                error_msg = "Script too complex (OOM)."
+            
+            has_output = False
+            recovery_output = ""
+            
+            if stdout.strip():
+                if "CRASH RECOVERY" in stdout or "-- CRASH RECOVERY:" in stdout:
+                    has_output = True
+                    recovery_output = stdout
+                    recovery_output += f"\n\n-- [RECOVERED] Partial output saved before crash: {error_msg}"
+                else:
+                    has_output = True
+                    recovery_output = stdout
+                    recovery_output += f"\n\n-- [PARTIAL] Output recovered before crash: {error_msg}"
+            
+            if not has_output and stderr and "CRASH RECOVERY" in stderr:
+                has_output = True
+                recovery_output = stderr
+                recovery_output += f"\n\n-- [RECOVERED] Crash recovery output: {error_msg}"
+            
+            if has_output:
+                stdout = recovery_output
+            else:
+                raise Exception(error_msg)
+
+        execution_time = (time.perf_counter() - start_time) * 1000
+
+        links = set(re.findall(r'https?://[^\s"\')]+', stdout))
+        clean_links = [l for l in links if "pastefy.app" not in l]
+        
+        link_text_result = ""
+        if clean_links:
+            link_text_result = "\n" + "\n".join(clean_links)
+
+        random_name = generate_random_name()
+        paste_url = "Upload failed"
+        try:
+            if isinstance(stdout, bytes):
+                stdout_str = stdout.decode('utf-8', errors='ignore')
+            else:
+                stdout_str = stdout
+            
+            paste_data = await asyncio.to_thread(create_paste, f"{random_name}_femboy.lua", stdout_str)
+            
+            if paste_data.get("success"):
+                paste_obj = paste_data.get("paste", {})
+                paste_url = paste_obj.get("raw_url") or paste_obj.get("url") or "URL Missing in Response"
+            else:
+                print(f"[ERROR] Pastefy API Error: {paste_data}")
+                paste_url = f"API Error: {paste_data.get('message') or paste_data.get('error') or 'Unknown'}"
+
+        except Exception as e:
+            print(f"[ERROR] Pastefy upload failed: {e}")
+            paste_url = "Pastefy Error"
+
+        response_text = f"Finished in {execution_time:.2f}ms{link_text_result}\n\nPastefy Link: {paste_url}"
+        
+        if len(response_text) > 1900:
+            response_text = f"Finished in {execution_time:.2f}ms\n\nPastefy Link: {paste_url}"
+        
+        if process.returncode != 0:
+            response_text = f"⚠️ **Crashed / Partial Output**\n" + response_text
+        
+        output_filename = f"{random_name}_femboy.lua"
+        
+        if isinstance(stdout, bytes):
+            stdout_str = stdout.decode('utf-8', errors='ignore')
+        else:
+            stdout_str = stdout
+            
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.lua', encoding='utf-8') as out_tmp:
+            out_tmp.write(stdout_str)
+            output_path = out_tmp.name
+            
+        try:
+            file_attachment = discord.File(output_path, filename=output_filename)
+            await status_msg.edit(content=response_text, attachments=[file_attachment])
+        finally:
+            try:
+                os.unlink(output_path)
+            except:
+                pass
+
+    except Exception as e:
+        print(f"[ERROR] Processing failure: {e}")
+        await status_msg.edit(content=f"❌ Error: {str(e)}")
+
 # ---------------- START ----------------
 _args = sys.argv[1:]
 
@@ -2933,7 +3173,7 @@ if "-" in _args:
     sys.exit(0)
 
 if not TOKEN:
-    print("BOT_TOKEN missing")
-    exit()
+    print("ERROR: DISCORD_TOKEN environment variable is not set. Please add your Discord bot token as a secret.")
+    exit(1)
 
 bot.run(TOKEN)
